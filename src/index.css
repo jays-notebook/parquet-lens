@@ -1,0 +1,55 @@
+@import "tailwindcss";
+
+/* Dark theme CSS variables — parquet-lens design system
+ * Source: UI-SPEC.md §Color (neutral dark preset via shadcn class strategy)
+ * All values are hard-set to dark; there is no light theme in v1.
+ */
+@layer base {
+  :root {
+    /* 60% dominant — app background */
+    --background: #09090b;       /* zinc-950 */
+    /* 30% secondary — toolbar, editor container, grid header */
+    --card: #18181b;             /* zinc-900 */
+    --muted: #18181b;            /* zinc-900 */
+    /* 10% accent — run button, open-area border, focus ring */
+    --primary: #3b82f6;          /* blue-500 */
+    --primary-foreground: #fafafa;
+    /* Text */
+    --foreground: #fafafa;       /* zinc-50 — all body and label text */
+    --card-foreground: #fafafa;
+    --muted-foreground: #a1a1aa; /* zinc-400 — secondary labels, chip text */
+    /* Structural */
+    --border: #27272a;           /* zinc-800 — grid dividers, toolbar border */
+    --input: #27272a;
+    --ring: #3b82f6;             /* blue-500 — focus ring (same as accent) */
+    /* Destructive — reserved for Phase 2 error states */
+    --destructive: #ef4444;      /* red-500 */
+    --destructive-foreground: #fafafa;
+    /* Popover / secondary */
+    --popover: #18181b;
+    --popover-foreground: #fafafa;
+    --secondary: #27272a;
+    --secondary-foreground: #fafafa;
+    --accent: #27272a;
+    --accent-foreground: #fafafa;
+    /* Radius */
+    --radius: 0.5rem;
+  }
+}
+
+@layer base {
+  * {
+    border-color: var(--border);
+    outline-color: var(--ring);
+  }
+
+  body {
+    background-color: var(--background);
+    color: var(--foreground);
+    font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+    /* Disable browser default text selection styling to allow custom grid behavior */
+    -webkit-font-smoothing: antialiased;
+  }
+}

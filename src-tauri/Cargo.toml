@@ -1,0 +1,29 @@
+[package]
+name = "parquet-lens"
+version = "0.2.0"
+edition = "2024"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "parquet_lens_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+# DataFusion 54 re-exports arrow and parquet; do NOT add them as direct deps (PITFALLS.md §Pitfall 3)
+datafusion = { version = "54", features = ["parquet"] }
+object_store = { version = "0.13", features = ["aws"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+futures = "0.3"
+
+[features]
+# This feature is used for production builds or when `devPath` points to the filesystem
+# DO NOT REMOVE!!
+custom-protocol = ["tauri/custom-protocol"]
