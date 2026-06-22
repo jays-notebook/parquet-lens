@@ -1,0 +1,86 @@
+name: Build installers
+
+# Build Windows (.exe / .msi) and macOS (.dmg) installers for parquet-lens.
+#
+# Triggers:
+#   - Pushing a tag like `v0.2.0`  -> builds and publishes a DRAFT GitHub Release
+#                                     with the installers attached.
+#   - Manual run (workflow_dispatch) -> builds and uploads the installers as
+#                                       workflow artifacts (no Release created).
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+# Required so tauri-action can create the GitHub Release on tag builds.
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      # Keep building the other OS even if one fails, so a macOS-only issue
+      # (e.g. icons) still yields the Windows installer and vice versa.
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest      # arm64 runner; builds a universal binary
+            rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
+            tauri-args: '--target universal-apple-darwin'
+          - platform: windows-latest
+            rust-targets: ''
+            tauri-args: ''
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets }}
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build app and (on tag) publish release
+        id: tauri
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # tagName/releaseName are only set on tag pushes. When empty,
+          # tauri-action just builds and creates no Release.
+          tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+          releaseName: ${{ startsWith(github.ref, 'refs/tags/') && format('Parquet Lens {0}', github.ref_name) || '' }}
+          releaseBody: 'Download the installer for your platform from the assets below.'
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.tauri-args }}
+
+      # On manual runs there is no tag/Release, so expose the installers as
+      # downloadable workflow artifacts instead.
+      - name: Upload installers as artifacts (manual runs)
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: installers-${{ matrix.platform }}
+          if-no-files-found: warn
+          path: |
+            src-tauri/target/**/release/bundle/**/*.dmg
+            src-tauri/target/**/release/bundle/**/*.exe
+            src-tauri/target/**/release/bundle/**/*.msi
