@@ -1,0 +1,7 @@
+# Code owners for parquet-lens.
+#
+# Listed owners are automatically requested for review on any pull request
+# that touches matching files. The last matching pattern takes precedence.
+
+# Default owner for everything in the repository.
+* @jays-notebook
