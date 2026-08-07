@@ -16,10 +16,11 @@ audit-log.jsonl
 /null
 *.tmp.*
 
-# Claude / GSD machine-local state
-.claude/settings.local.json
-.claude/.gsd-profile
-.claude/gsd-install-state.json
+# Claude Code — managed centrally in the agent-settings repo;
+# CLAUDE.md, .claude, and .planning are local symlinks into ../agent-settings/parquet-lens/
+CLAUDE.md
+.claude
+.planning
 
 # IDE
 .idea
