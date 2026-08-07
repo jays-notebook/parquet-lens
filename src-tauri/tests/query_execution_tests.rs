@@ -534,6 +534,157 @@ fn normalize_view_types_passthrough_non_view_batch() {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 1 Plan 01 Task 1: RunQueryResponse carries the QUERY RESULT schema
+// ---------------------------------------------------------------------------
+
+/// ROADMAP Success Criterion 4 (automated form): for `select * from data` the
+/// result schema reported by `execute()` must be field-for-field identical to the
+/// file schema reported by `get_schema()`.
+///
+/// Both labels are produced by the SAME `format!("{:?}", field.data_type())`
+/// expression (`context.rs::get_schema` and `executor.rs::execute`), so parity is
+/// true by construction for every Arrow type — including nested, dictionary,
+/// decimal, temporal and view types. This test pins that contract.
+#[tokio::test]
+async fn test_execute_result_schema_matches_file_schema_for_select_star() {
+    let fixture_path = small_fixture_path();
+    let source = LocalFileSource::new(fixture_path).expect("small fixture must exist");
+
+    let mut engine = QueryEngine::new();
+    engine
+        .register_source(&source)
+        .await
+        .expect("register_source must succeed");
+
+    let file_schema = engine.get_schema().expect("get_schema must succeed");
+
+    let (meta, _ipc_bytes) = engine
+        .execute("select * from data")
+        .await
+        .expect("execute must succeed");
+
+    assert_eq!(
+        meta.schema.len(),
+        file_schema.len(),
+        "ROADMAP Success Criterion 4: `select *` result schema must have the same \
+         column count as the file schema ({} result vs {} file)",
+        meta.schema.len(),
+        file_schema.len()
+    );
+
+    for (i, (result_field, file_field)) in meta.schema.iter().zip(file_schema.iter()).enumerate() {
+        assert_eq!(
+            result_field.name, file_field.name,
+            "ROADMAP Success Criterion 4: column {} name must match the file schema",
+            i
+        );
+        assert_eq!(
+            result_field.arrow_type, file_field.arrow_type,
+            "ROADMAP Success Criterion 4: column {} ('{}') arrow_type must be \
+             byte-identical to the file schema label — both must come from the same \
+             format!(\"{{:?}}\", data_type) expression",
+            i, file_field.name
+        );
+        assert_eq!(
+            result_field.nullable, file_field.nullable,
+            "ROADMAP Success Criterion 4: column {} ('{}') nullable must match the file schema",
+            i, file_field.name
+        );
+    }
+}
+
+/// RESULT-01/RESULT-03: an aggregate result reports its OWN column, not the file's.
+#[tokio::test]
+async fn test_execute_result_schema_for_count_star() {
+    let fixture_path = small_fixture_path();
+    let source = LocalFileSource::new(fixture_path).expect("small fixture must exist");
+
+    let mut engine = QueryEngine::new();
+    engine
+        .register_source(&source)
+        .await
+        .expect("register_source must succeed");
+
+    let (meta, _ipc_bytes) = engine
+        .execute("select count(*) from data")
+        .await
+        .expect("execute must succeed");
+
+    assert_eq!(
+        meta.schema.len(),
+        1,
+        "count(*) must produce exactly one result column, got {}",
+        meta.schema.len()
+    );
+    assert_eq!(
+        meta.schema[0].name, "count(*)",
+        "count(*) result column must carry DataFusion's raw output name"
+    );
+    assert_eq!(
+        meta.schema[0].arrow_type, "Int64",
+        "count(*) result column must be labelled Int64, not the source column's type"
+    );
+}
+
+/// RESULT-03: an aliased projection reports the alias, not the source column name.
+#[tokio::test]
+async fn test_execute_result_schema_for_alias() {
+    let fixture_path = small_fixture_path();
+    let source = LocalFileSource::new(fixture_path).expect("small fixture must exist");
+
+    let mut engine = QueryEngine::new();
+    engine
+        .register_source(&source)
+        .await
+        .expect("register_source must succeed");
+
+    let (meta, _ipc_bytes) = engine
+        .execute("select id as label from data")
+        .await
+        .expect("execute must succeed");
+
+    assert_eq!(
+        meta.schema.len(),
+        1,
+        "an aliased single-column projection must produce one result column, got {}",
+        meta.schema.len()
+    );
+    assert_eq!(
+        meta.schema[0].name, "label",
+        "the result column must carry the alias `label`, not the source column name"
+    );
+}
+
+/// The schema comes from the executed stream, not from the retained batches —
+/// so a zero-row result still knows its columns and the grid can render headers.
+#[tokio::test]
+async fn test_execute_result_schema_present_for_empty_result() {
+    let fixture_path = small_fixture_path();
+    let source = LocalFileSource::new(fixture_path).expect("small fixture must exist");
+
+    let mut engine = QueryEngine::new();
+    engine
+        .register_source(&source)
+        .await
+        .expect("register_source must succeed");
+
+    let (meta, _ipc_bytes) = engine
+        .execute("select * from data where id < 0")
+        .await
+        .expect("execute must succeed");
+
+    assert_eq!(
+        meta.total_rows, 0,
+        "an always-false predicate must return zero rows, got {}",
+        meta.total_rows
+    );
+    assert!(
+        !meta.schema.is_empty(),
+        "a zero-row result must still carry a fully populated result schema"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Bonus: get_page returns correct slice from cached result
 // ---------------------------------------------------------------------------
 
