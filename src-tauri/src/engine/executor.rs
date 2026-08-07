@@ -21,7 +21,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use futures::StreamExt;
 
 use crate::engine::QueryEngine;
-use crate::ipc::{PageResponse, RunQueryResponse};
+use crate::ipc::{PageResponse, RunQueryResponse, SchemaField};
 use crate::ipc::serializer::record_batches_to_ipc;
 
 /// Maximum number of rows the executor will retain from any single query execution.
@@ -37,9 +37,11 @@ impl QueryEngine {
     ///
     /// 1. Builds a `DataFrame` via `SessionContext::sql`.
     /// 2. Streams batches via `execute_stream()` — never `collect()` (PITFALLS.md §Pitfall 1).
-    /// 3. Accumulates rows until `ROW_CAP` is hit; slices the final batch to fit exactly.
-    /// 4. Serializes retained batches to Arrow IPC bytes via `record_batches_to_ipc`.
-    /// 5. Caches the retained batches for `get_page`.
+    /// 3. Captures the RESULT schema from the stream, before draining it, so the frontend
+    ///    can build grid columns from the result rather than the opened file (D-PH1-01).
+    /// 4. Accumulates rows until `ROW_CAP` is hit; slices the final batch to fit exactly.
+    /// 5. Serializes retained batches to Arrow IPC bytes via `record_batches_to_ipc`.
+    /// 6. Caches the retained batches for `get_page`.
     ///
     /// `result_cache` (the `Vec<serde_json::Value>` field from Plan 01) is cleared on each call.
     pub async fn execute(&mut self, sql: &str) -> Result<(RunQueryResponse, Vec<u8>), String> {
@@ -58,6 +60,30 @@ impl QueryEngine {
             .execute_stream()
             .await
             .map_err(|e| format!("Failed to start query stream: {}", e))?;
+
+        // Capture the RESULT schema before the 'drain loop consumes the stream.
+        //
+        // This is taken PRE-normalization on purpose: `normalize_view_types` below
+        // downcasts Utf8View→Utf8 (and BinaryView→Binary) purely so apache-arrow JS v21
+        // can decode the IPC bytes, while `get_schema` reports the file's UN-normalized
+        // types. Labelling from the normalized schema would make a natively-view-typed
+        // column read `Utf8View` in the sidebar but `Utf8` in the grid (D-PH1-02).
+        //
+        // Reading the schema from the stream (rather than the retained batches) also means
+        // a zero-row result still reports its full column list.
+        let result_schema = stream.schema();
+        let schema: Vec<SchemaField> = result_schema
+            .fields()
+            .iter()
+            .map(|field| SchemaField {
+                name: field.name().clone(),
+                // MUST stay character-for-character identical to the expression in
+                // `context.rs::get_schema` — otherwise `select *` grid headers would
+                // diverge from the sidebar's file-schema labels (D-PH1-01).
+                arrow_type: format!("{:?}", field.data_type()),
+                nullable: field.is_nullable(),
+            })
+            .collect();
 
         let mut retained_batches: Vec<RecordBatch> = Vec::new();
         let mut total_rows: usize = 0;
@@ -116,6 +142,7 @@ impl QueryEngine {
         let response = RunQueryResponse {
             total_rows,
             capped,
+            schema,
         };
 
         // Cache the metadata so `get_last_result_meta` can retrieve the authoritative `capped` flag.

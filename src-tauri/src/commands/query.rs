@@ -113,11 +113,17 @@ pub async fn run_query(
     Ok(tauri::ipc::Response::new(ipc_bytes))
 }
 
-/// Returns the metadata from the most recent `run_query` call (total_rows, capped).
+/// Returns the metadata from the most recent `run_query` call
+/// (`total_rows`, `capped`, and the query RESULT schema).
 ///
 /// Must be called after `run_query`. Returns an error if no query has been executed.
 /// This command exists so row data (binary IPC) and metadata (JSON) travel on separate channels
-/// (CONTEXT.md: JSON only for sub-10KB metadata, binary IPC for row data).
+/// (CONTEXT.md: JSON only for sub-10KB metadata, binary IPC for row data). The result schema
+/// belongs on this channel because it is metadata sized by column count (D-PH1-01).
+///
+/// The cached struct is cloned wholesale rather than rebuilt field-by-field: a manual rebuild
+/// silently drops any newly added field (it dropped `schema` before this change) and is a
+/// recurring maintenance hazard.
 #[tauri::command]
 pub async fn get_last_result_meta(
     state: tauri::State<'_, AppState>,
@@ -128,10 +134,7 @@ pub async fn get_last_result_meta(
         .as_ref()
         .ok_or_else(|| "No query results cached. Call run_query first.".to_string())?;
 
-    Ok(RunQueryResponse {
-        total_rows: meta.total_rows,
-        capped: meta.capped,
-    })
+    Ok(meta.clone())
 }
 
 /// Returns a page of rows from the cached result of the most recent `run_query`.
