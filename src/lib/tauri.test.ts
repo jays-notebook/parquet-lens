@@ -1,5 +1,6 @@
 /**
- * Behavioral tests for openRemoteFile() invoke wrapper (REMOTE-01).
+ * Behavioral tests for openRemoteFile() invoke wrapper (REMOTE-01)
+ * and for the result-schema-driven row decoding helpers (Phase 1, Plan 01).
  *
  * Verifies that openRemoteFile() invokes the Tauri command named exactly
  * "open_remote_file" with payload shape `{ conn }` containing all 5
@@ -12,8 +13,15 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
 }));
 
+import { tableFromArrays } from "apache-arrow";
 import { invoke } from "@tauri-apps/api/core";
-import { openRemoteFile, type RemoteConnection, type OpenFileResponse } from "./tauri";
+import {
+  arrowTableToRows,
+  dedupeFieldKeys,
+  openRemoteFile,
+  type RemoteConnection,
+  type OpenFileResponse,
+} from "./tauri";
 
 const mockInvoke = vi.mocked(invoke);
 
@@ -66,5 +74,59 @@ describe("openRemoteFile IPC contract (REMOTE-01)", () => {
     const result = await openRemoteFile(FIXTURE);
 
     expect(result).toEqual(response);
+  });
+});
+
+describe("dedupeFieldKeys", () => {
+  it("leaves a duplicate-free list unchanged", () => {
+    expect(dedupeFieldKeys(["id", "name"])).toEqual(["id", "name"]);
+  });
+
+  it("suffixes the second occurrence with __2", () => {
+    expect(dedupeFieldKeys(["price", "price"])).toEqual(["price", "price__2"]);
+  });
+
+  it("numbers each further occurrence in order", () => {
+    expect(dedupeFieldKeys(["price", "price", "price"])).toEqual([
+      "price",
+      "price__2",
+      "price__3",
+    ]);
+  });
+
+  it("counts occurrences per name when duplicates interleave", () => {
+    expect(dedupeFieldKeys(["a", "b", "a", "b", "a"])).toEqual([
+      "a",
+      "b",
+      "a__2",
+      "b__2",
+      "a__3",
+    ]);
+  });
+
+  it("returns an empty array for an empty input", () => {
+    expect(dedupeFieldKeys([])).toEqual([]);
+  });
+
+  it("always preserves length and produces unique keys", () => {
+    const input = ["x", "x", "y", "x", "y", "z"];
+    const out = dedupeFieldKeys(input);
+
+    expect(out).toHaveLength(input.length);
+    expect(new Set(out).size).toBe(input.length);
+  });
+});
+
+describe("arrowTableToRows", () => {
+  it("reads columns positionally and converts bigint cells to strings", () => {
+    const table = tableFromArrays({
+      id: BigInt64Array.from([1n, 2n]),
+      ratio: Float64Array.from([1.5, 2.5]),
+    });
+
+    expect(arrowTableToRows(table)).toEqual([
+      { id: "1", ratio: 1.5 },
+      { id: "2", ratio: 2.5 },
+    ]);
   });
 });
