@@ -187,6 +187,41 @@ export function dedupeFieldKeys(names: string[]): string[] {
 }
 
 /**
+ * The literal output-column name DataFusion 54 emits for `select count(*)`.
+ * Compared against the lowercased, trimmed input — never used as a row key.
+ */
+const COUNT_STAR_OUTPUT_NAME = "count(*)";
+
+/**
+ * Maps a result-column name to the name shown to the user.
+ *
+ * DataFusion 54 names the output column of `select count(*) from data`
+ * literally `count(*)`. PROJECT.md locks the display form as a clean `count`,
+ * so the user reads a plain `count : <value>` presentation. Every other name —
+ * including other aggregates (`sum(price)`, `avg(price)`), computed columns and
+ * explicit SQL aliases — passes through verbatim, with its original whitespace
+ * and casing intact. An alias always wins: `select count(*) as n` makes
+ * DataFusion name the column `n`, which no longer matches and is never rewritten.
+ *
+ * # PRESENTATION ONLY — never use this as a key
+ *
+ * Column ids, `accessorFn` lookups and row-object keys all use the deduped keys
+ * from {@link dedupeFieldKeys}, which are derived from the RAW backend names.
+ * Feeding this function's result into an id, an accessor, or `dedupeFieldKeys`
+ * would desynchronise column ids from row keys and make every cell resolve to
+ * `undefined` (rendering as NULL). Use it only where a name is displayed:
+ * header text and the `<th>` tooltip.
+ */
+export function displayColumnName(name: string): string {
+  if (name.trim().toLowerCase() === COUNT_STAR_OUTPUT_NAME) {
+    return "count";
+  }
+  // Passthrough is the ORIGINAL argument, untrimmed — the trim above is only a
+  // comparison tolerance, not a normalisation applied to every name.
+  return name;
+}
+
+/**
  * Converts a columnar Apache Arrow `Table` to an array of row objects.
  *
  * Columns are read POSITIONALLY via `getChildAt(i)` rather than by name, so two

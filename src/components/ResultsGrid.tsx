@@ -18,6 +18,12 @@
  * result columns with the same name stay independent (D-PH1-03); headers still
  * display the original un-deduped `SchemaField.name`.
  *
+ * Phase 1 (Plan 01-02): headers and tooltips render a DISPLAY name via
+ * `displayColumnName` (which cleans DataFusion's `count(*)` to `count`, RESULT-02)
+ * while ids and accessors keep using the deduped RAW keys. The two must not be
+ * unified: row objects are keyed by the raw backend names, so a display name in an
+ * id or accessor would resolve to `undefined` and render every cell as NULL.
+ *
  * Source: STACK.md §TanStack Table + Virtual, UI-SPEC.md §Results Grid
  */
 
@@ -27,7 +33,7 @@ import {
   useReactTable,
   type ColumnDef,
 } from "@tanstack/react-table";
-import { dedupeFieldKeys, type SchemaField } from "@/lib/tauri";
+import { dedupeFieldKeys, displayColumnName, type SchemaField } from "@/lib/tauri";
 import { useShallow } from "zustand/react/shallow";
 import { useAppStore } from "@/store/appStore";
 import { LoadingOverlay } from "@/components/LoadingOverlay";
@@ -54,7 +60,7 @@ export function ResultsGrid() {
     header: () => (
       <div style={{ lineHeight: 1.3 }}>
         <div style={{ fontWeight: 600, color: "var(--foreground)" }}>
-          {field.name}
+          {displayColumnName(field.name)}
         </div>
         <div style={{ fontSize: "11px", color: "var(--muted-foreground)", fontWeight: 400 }}>
           {field.arrow_type}
@@ -149,7 +155,7 @@ export function ResultsGrid() {
                     const meta = header.column.columnDef.meta as { field: SchemaField } | undefined;
                     const f = meta?.field;
                     const titleText = f
-                      ? `${f.name} (${f.arrow_type}${f.nullable ? ", nullable" : ", not null"})`
+                      ? `${displayColumnName(f.name)} (${f.arrow_type}${f.nullable ? ", nullable" : ", not null"})`
                       : undefined;
                     return (
                     <th
