@@ -18,6 +18,7 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   arrowTableToRows,
   dedupeFieldKeys,
+  displayColumnName,
   openRemoteFile,
   type RemoteConnection,
   type OpenFileResponse,
@@ -114,6 +115,48 @@ describe("dedupeFieldKeys", () => {
 
     expect(out).toHaveLength(input.length);
     expect(new Set(out).size).toBe(input.length);
+  });
+});
+
+describe("displayColumnName", () => {
+  it("cleans the DataFusion count(*) output name to count", () => {
+    expect(displayColumnName("count(*)")).toBe("count");
+  });
+
+  it("matches the count(*) output name case-insensitively", () => {
+    expect(displayColumnName("COUNT(*)")).toBe("count");
+    expect(displayColumnName("Count(*)")).toBe("count");
+  });
+
+  it("tolerates surrounding whitespace around count(*)", () => {
+    expect(displayColumnName("count(*) ")).toBe("count");
+    expect(displayColumnName("  count(*)  ")).toBe("count");
+  });
+
+  it("never rewrites an explicit SQL alias", () => {
+    // `select count(*) as n` — DataFusion already named the column `n`, so it
+    // no longer matches the star form and must pass through untouched.
+    expect(displayColumnName("n")).toBe("n");
+    expect(displayColumnName("total")).toBe("total");
+  });
+
+  it("only cleans the star form, not count over a column", () => {
+    expect(displayColumnName("count(price)")).toBe("count(price)");
+    expect(displayColumnName("count(1)")).toBe("count(1)");
+  });
+
+  it("passes every other aggregate and plain name through verbatim", () => {
+    expect(displayColumnName("sum(price)")).toBe("sum(price)");
+    expect(displayColumnName("avg(price)")).toBe("avg(price)");
+    expect(displayColumnName("id")).toBe("id");
+  });
+
+  it("preserves original whitespace and casing of passthrough names", () => {
+    expect(displayColumnName("  Sum(Price) ")).toBe("  Sum(Price) ");
+  });
+
+  it("returns an empty string unchanged", () => {
+    expect(displayColumnName("")).toBe("");
   });
 });
 
