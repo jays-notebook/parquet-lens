@@ -41,7 +41,7 @@ export function useRunQuery() {
       const result = await runQuery(queryText);
       // Successful run: clear any prior inline error before setting results (D-01).
       setQueryError(null);
-      setResults(result.total_rows, result.capped, result.rows);
+      setResults(result.total_rows, result.capped, result.rows, result.schema);
     } catch (err) {
       // Surface the engine's verbatim error inline below the editor (QUERY-04 / D-03).
       setQueryError(err instanceof Error ? err.message : String(err));

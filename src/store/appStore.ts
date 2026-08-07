@@ -35,6 +35,17 @@ interface AppState {
 
   // Result state
   rows: Record<string, unknown>[];
+  /**
+   * Arrow schema of the most recent QUERY RESULT, supplied by the backend on the
+   * metadata channel. This is the SOLE source of the grid's columns and typed headers.
+   *
+   * `schema` above remains the FILE schema and is the sole source for the sidebar
+   * SchemaTab/SchemaPanel. The two must never be conflated — that conflation is the
+   * exact bug this phase fixes: the grid used to build columns from the file schema,
+   * so aggregates, aliases and computed columns rendered as all-NULL rows under the
+   * file's column names (RESULT-01/03/04).
+   */
+  resultSchema: SchemaField[];
   totalRows: number;
   capped: boolean;
 
@@ -86,11 +97,16 @@ interface AppState {
   /**
    * Store query results after a successful run_query call.
    * Accepts rows directly (decoded from Arrow IPC on the call site).
+   *
+   * `resultSchema` is a REQUIRED fourth positional argument, deliberately not
+   * optional and without a default: the arity change must be a compile error at
+   * every call site so the grid can never be silently left on stale columns.
    */
   setResults: (
     totalRows: number,
     capped: boolean,
-    rows: Record<string, unknown>[]
+    rows: Record<string, unknown>[],
+    resultSchema: SchemaField[]
   ) => void;
   /** Set or clear the inline query error (D-01). Pass null to clear. */
   setQueryError: (msg: string | null) => void;
@@ -119,6 +135,7 @@ export const useAppStore = create<AppState>((set) => ({
   queryError: null,
   toastMessage: null,
   rows: [],
+  resultSchema: [],
   totalRows: 0,
   capped: false,
   sidebarCollapsed: false,
@@ -136,6 +153,7 @@ export const useAppStore = create<AppState>((set) => ({
       schema,
       queryText: DEFAULT_QUERY,
       rows: [],
+      resultSchema: [], // the previous file's result columns must not outlive it
       totalRows: 0,
       capped: false,
       isLoading: false,
@@ -154,9 +172,10 @@ export const useAppStore = create<AppState>((set) => ({
 
   setLoading: (loading) => set({ isLoading: loading }),
 
-  setResults: (totalRows, capped, rows) =>
+  setResults: (totalRows, capped, rows, resultSchema) =>
     set({
       rows,
+      resultSchema,
       totalRows,
       capped,
       isLoading: false,
@@ -188,6 +207,7 @@ export const useAppStore = create<AppState>((set) => ({
       queryError: null, // D-04: reset clears all transient error state
       toastMessage: null,
       rows: [],
+      resultSchema: [], // no file, no result columns
       totalRows: 0,
       capped: false,
       fileMetadata: null,

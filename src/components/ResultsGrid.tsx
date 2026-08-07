@@ -7,6 +7,17 @@
  * Phase 2 (Plan 03): Two-line typed headers (GRID-02), header tooltips (GRID-06),
  * italic gray NULL marker distinct from blank empty strings (GRID-04).
  *
+ * Phase 1 (Plan 01-01): Columns now derive from the query RESULT schema
+ * (`appStore.resultSchema`, supplied by the backend on the metadata channel)
+ * rather than the FILE schema (`appStore.schema`). Reading the file schema here
+ * is what made aggregates, aliases and computed columns render as all-NULL rows
+ * under the file's column names (RESULT-01/03/04). `appStore.schema` remains the
+ * sidebar's source (SchemaTab / SchemaPanel) and must NOT be read in this file.
+ *
+ * Column ids and row keys are the DEDUPED keys from `dedupeFieldKeys`, so two
+ * result columns with the same name stay independent (D-PH1-03); headers still
+ * display the original un-deduped `SchemaField.name`.
+ *
  * Source: STACK.md §TanStack Table + Virtual, UI-SPEC.md §Results Grid
  */
 
@@ -16,21 +27,28 @@ import {
   useReactTable,
   type ColumnDef,
 } from "@tanstack/react-table";
-import type { SchemaField } from "@/lib/tauri";
+import { dedupeFieldKeys, type SchemaField } from "@/lib/tauri";
 import { useShallow } from "zustand/react/shallow";
 import { useAppStore } from "@/store/appStore";
 import { LoadingOverlay } from "@/components/LoadingOverlay";
 
 export function ResultsGrid() {
-  const { rows, isLoading, schema } = useAppStore(useShallow((s) => ({
+  const { rows, isLoading, resultSchema } = useAppStore(useShallow((s) => ({
     rows: s.rows,
     isLoading: s.isLoading,
-    schema: s.schema,
+    resultSchema: s.resultSchema,
   })));
 
-  const columns: ColumnDef<Record<string, unknown>, unknown>[] = schema.map((field) => ({
-    id: field.name,
-    accessorKey: field.name,
+  // Same positional field-name list `arrowTableToRows` keyed the rows with, so
+  // column ids and row keys are guaranteed to agree (D-PH1-03).
+  const columnKeys = dedupeFieldKeys(resultSchema.map((f) => f.name));
+
+  const columns: ColumnDef<Record<string, unknown>, unknown>[] = resultSchema.map((field, i) => ({
+    id: columnKeys[i],
+    // accessorFn, NOT accessorKey: TanStack treats accessorKey as a dot-delimited
+    // deep path, so a result column named e.g. `sum(a.b)` — which DataFusion will
+    // happily emit — would silently resolve to undefined and render as NULL.
+    accessorFn: (row: Record<string, unknown>) => row[columnKeys[i]],
     // D-10: Two-line header — column name (bold) over Arrow-native type (dimmed).
     // Arrow-native type names are locked from Phase 1 (no SQL aliases).
     header: () => (
