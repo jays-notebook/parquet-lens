@@ -10,8 +10,16 @@
  * # IPC design for run_query (CONTEXT.md D-06, STACK.md §IPC Serialization Strategy)
  *
  * Row data travels as Arrow IPC binary (ArrayBuffer) via `run_query` →
- * `tauri::ipc::Response`. Metadata (total_rows, capped) travels as JSON via
- * `get_last_result_meta`. The two-call pattern keeps bulk row data off the JSON channel.
+ * `tauri::ipc::Response`. Metadata (total_rows, capped, and the query RESULT schema)
+ * travels as JSON via `get_last_result_meta`. The two-call pattern keeps bulk row data
+ * off the JSON channel.
+ *
+ * The result schema belongs on the metadata channel because it is sized by column
+ * count, not row count — it stays far below the JSON weight budget while bulk row
+ * data remains on the binary channel. Sourcing it from the backend (rather than
+ * deriving type labels from the decoded Arrow-JS table) is what makes the grid's
+ * type labels identical to the sidebar's file-schema labels: both are produced by
+ * the same Rust `format!("{:?}", data_type)` expression (D-PH1-01).
  */
 import { invoke } from "@tauri-apps/api/core";
 import { tableFromIPC, type Table } from "apache-arrow";
@@ -34,6 +42,14 @@ export interface RunQueryResponse {
   total_rows: number;
   /** `true` when the backend 100-row cap was hit. */
   capped: boolean;
+  /**
+   * Schema of the QUERY RESULT — not the opened file's schema.
+   *
+   * Supplied by the backend on the JSON metadata channel. Its `arrow_type`
+   * strings are produced by the same Rust expression as the file schema, so the
+   * two are identical by construction for every Arrow type (D-PH1-01).
+   */
+  schema: SchemaField[];
 }
 
 /** The decoded query result ready for rendering. */
@@ -46,6 +62,12 @@ export interface QueryResult {
   total_rows: number;
   /** True when the 100-row backend cap was hit. */
   capped: boolean;
+  /**
+   * Schema of the QUERY RESULT, straight from the backend metadata channel —
+   * never derived from the decoded Arrow-JS table. This is the sole source of
+   * the grid's columns and typed headers (D-PH1-01).
+   */
+  schema: SchemaField[];
 }
 
 /** A single page of result rows returned by `get_page`. */
@@ -115,6 +137,9 @@ export async function runQuery(sql: string): Promise<QueryResult> {
       rows: [],
       total_rows: 0,
       capped: false,
+      // A zero-row result still knows its columns — the backend takes the schema
+      // from the executed stream, not from the retained batches.
+      schema: meta.schema,
     };
   }
 
@@ -130,11 +155,44 @@ export async function runQuery(sql: string): Promise<QueryResult> {
     rows,
     total_rows: meta.total_rows,
     capped: meta.capped,
+    schema: meta.schema,
   };
 }
 
 /**
+ * Makes a positional list of column names unique, preserving order and length.
+ *
+ * The nth occurrence (n ≥ 2) of a name becomes `${name}__${n}`; the first
+ * occurrence keeps the bare name.
+ *
+ * # Why this exists (D-PH1-03)
+ *
+ * `arrowTableToRows` returns `Record<string, unknown>`, so two result columns
+ * with the same name — which SQL happily produces, e.g.
+ * `select a, b as a from data` — would collapse to a single object key and the
+ * grid would render duplicate TanStack column ids. Deduping positionally keeps
+ * each column independent, with its own values.
+ *
+ * The ORIGINAL name is still what the user sees: the grid header renders
+ * `SchemaField.name`, while the deduped key is only ever a lookup key.
+ */
+export function dedupeFieldKeys(names: string[]): string[] {
+  const seen = new Map<string, number>();
+
+  return names.map((name) => {
+    const count = (seen.get(name) ?? 0) + 1;
+    seen.set(name, count);
+    return count === 1 ? name : `${name}__${count}`;
+  });
+}
+
+/**
  * Converts a columnar Apache Arrow `Table` to an array of row objects.
+ *
+ * Columns are read POSITIONALLY via `getChildAt(i)` rather than by name, so two
+ * same-named result columns produce two independent values instead of the same
+ * column being read twice (D-PH1-03). Each value is keyed by the deduped key
+ * for its position.
  *
  * Each cell value is converted to a display-safe representation:
  * - null → undefined (renders as blank in the grid, D-06)
@@ -144,25 +202,29 @@ export async function runQuery(sql: string): Promise<QueryResult> {
 export function arrowTableToRows(table: Table): Record<string, unknown>[] {
   const rows: Record<string, unknown>[] = [];
   const numRows = table.numRows;
-  const schema = table.schema;
+  const fields = table.schema.fields;
+  // Computed once: the same positional field-name list the grid derives its
+  // column ids from, so row keys and column ids always agree.
+  const keys = dedupeFieldKeys(fields.map((f) => f.name));
 
   for (let r = 0; r < numRows; r++) {
     const row: Record<string, unknown> = {};
-    for (const field of schema.fields) {
-      const col = table.getChild(field.name);
+    for (let i = 0; i < fields.length; i++) {
+      const key = keys[i];
+      const col = table.getChildAt(i);
       if (!col) {
-        row[field.name] = undefined;
+        row[key] = undefined;
         continue;
       }
       const raw = col.get(r);
       if (raw === null || raw === undefined) {
         // NULL → undefined so the grid renders a blank cell (D-06).
-        row[field.name] = undefined;
+        row[key] = undefined;
       } else if (typeof raw === "bigint") {
         // BigInt cannot be passed directly to React as a cell value.
-        row[field.name] = raw.toString();
+        row[key] = raw.toString();
       } else {
-        row[field.name] = raw;
+        row[key] = raw;
       }
     }
     rows.push(row);
