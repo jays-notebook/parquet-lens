@@ -5,6 +5,7 @@
  * appStore.ts. The tests follow the behavior spec in 04-02-PLAN.md §Task 1.
  */
 import { describe, it, expect, beforeEach } from "vitest";
+import type { SchemaField } from "../lib/tauri";
 import { useAppStore } from "./appStore";
 
 // Reset store state before each test to avoid cross-test contamination
@@ -239,5 +240,67 @@ describe("lastRemoteConnection (D-05 autofill)", () => {
     useAppStore.getState().setFile("/tmp/other.parquet", []);
     // Must survive — autofill persists through local file opens too
     expect(useAppStore.getState().lastRemoteConnection).toEqual(fixture);
+  });
+});
+
+/**
+ * Phase 1 Plan 01: `resultSchema` holds the QUERY RESULT schema and is the sole
+ * source of the grid's columns, while `schema` stays the FILE schema for the
+ * sidebar. Conflating the two is the exact bug this phase fixes.
+ */
+const RESULT_SCHEMA_FIXTURE: SchemaField[] = [
+  { name: "count(*)", arrow_type: "Int64", nullable: false },
+];
+
+const FILE_SCHEMA_FIXTURE: SchemaField[] = [
+  { name: "id", arrow_type: "Int64", nullable: false },
+  { name: "name", arrow_type: "Utf8", nullable: true },
+];
+
+describe("resultSchema (result-schema-driven grid)", () => {
+  it("starts as an empty array", () => {
+    expect(useAppStore.getState().resultSchema).toEqual([]);
+  });
+
+  it("setResults stores the result schema", () => {
+    useAppStore
+      .getState()
+      .setResults(7, false, [{ "count(*)": "7" }], RESULT_SCHEMA_FIXTURE);
+
+    expect(useAppStore.getState().resultSchema).toEqual(RESULT_SCHEMA_FIXTURE);
+  });
+
+  it("setResults leaves the FILE schema untouched", () => {
+    useAppStore.getState().setFile("/tmp/foo.parquet", FILE_SCHEMA_FIXTURE);
+
+    useAppStore
+      .getState()
+      .setResults(7, false, [{ "count(*)": "7" }], RESULT_SCHEMA_FIXTURE);
+
+    const state = useAppStore.getState();
+    // The sidebar still sees the file's columns...
+    expect(state.schema).toEqual(FILE_SCHEMA_FIXTURE);
+    // ...while the grid sees the aggregate's own column.
+    expect(state.resultSchema).toEqual(RESULT_SCHEMA_FIXTURE);
+  });
+
+  it("setFile clears resultSchema", () => {
+    useAppStore
+      .getState()
+      .setResults(7, false, [{ "count(*)": "7" }], RESULT_SCHEMA_FIXTURE);
+
+    useAppStore.getState().setFile("/tmp/other.parquet", FILE_SCHEMA_FIXTURE);
+
+    expect(useAppStore.getState().resultSchema).toEqual([]);
+  });
+
+  it("reset clears resultSchema", () => {
+    useAppStore
+      .getState()
+      .setResults(7, false, [{ "count(*)": "7" }], RESULT_SCHEMA_FIXTURE);
+
+    useAppStore.getState().reset();
+
+    expect(useAppStore.getState().resultSchema).toEqual([]);
   });
 });

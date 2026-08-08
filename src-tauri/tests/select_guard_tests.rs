@@ -72,6 +72,111 @@ fn test_allow_block_comment_then_select() {
     );
 }
 
+#[test]
+fn test_allow_cte_select_still_permitted() {
+    // The recursive INTO check (WR-04) walks CTE bodies too — a plain read-only
+    // CTE must not become collateral damage.
+    let sql = "with c as (select * from data) select count(*) from c";
+    assert!(
+        guard_select_only(sql).is_ok(),
+        "a read-only CTE must still be allowed after the WR-04 recursive check"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Blocked: SELECT ... INTO (WR-04)
+//
+// sqlparser parses `SELECT * INTO t FROM data` as `Statement::Query` — the INTO
+// lives inside the `Select` body as `select.into` — so a naive `Query(_) => {}`
+// arm waves it through, and DataFusion then plans it as `CreateMemoryTable`.
+//
+// These tests assert `is_err()` rather than an exact message: if sqlparser ever
+// rejects a given INTO form at PARSE time, the guard still returns `Err` (with the
+// parse-error message) and the security property holds either way.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_reject_select_into() {
+    let result = guard_select_only("select * into new_table from data");
+    assert!(
+        result.is_err(),
+        "SELECT ... INTO creates a session table (CreateMemoryTable) and must be rejected (WR-04)"
+    );
+}
+
+#[test]
+fn test_reject_select_into_uppercase() {
+    let result = guard_select_only("SELECT * INTO t FROM data");
+    assert!(
+        result.is_err(),
+        "SELECT ... INTO must be rejected regardless of case — the guard is AST-based (WR-04/D-08)"
+    );
+}
+
+#[test]
+fn test_reject_select_into_in_set_operation() {
+    // The INTO hides in the RIGHT operand of a set operation, so a top-level-only
+    // check on the query body would miss it.
+    let result = guard_select_only("select a from data union all select b into t from data");
+    assert!(
+        result.is_err(),
+        "SELECT ... INTO nested in a set operation must be rejected — both operands \
+         of a UNION must be read-only (WR-04)"
+    );
+}
+
+#[test]
+fn test_reject_select_into_in_derived_table() {
+    // WR-01 (phase 02 review): the INTO hides in a FROM-clause derived table, which
+    // walking the outer `SetExpr` tree alone never reaches. Layer 1 must reject it
+    // itself — with its explicit read-only message, not the generic planning error.
+    let result = guard_select_only("select * from (select * into t from data) sub");
+    assert!(
+        result.is_err(),
+        "SELECT ... INTO inside a FROM-clause derived table must be rejected at \
+         layer 1 (WR-01)"
+    );
+    let msg = result.unwrap_err();
+    assert!(
+        msg.contains("read-only"),
+        "the rejection must carry the guard's explicit read-only message, proving \
+         layer 1 (not the plan-level backstop) caught it; got '{msg}'"
+    );
+}
+
+#[test]
+fn test_reject_select_into_in_joined_derived_table() {
+    // WR-01: the INTO hides in a JOINed relation, not the base relation, so the walk
+    // must cover every join operand too.
+    let result = guard_select_only(
+        "select * from data d join (select * into t from data) x on d.id = x.id",
+    );
+    assert!(
+        result.is_err(),
+        "SELECT ... INTO inside a JOINed derived table must be rejected at layer 1 (WR-01)"
+    );
+}
+
+#[test]
+fn test_allow_plain_derived_table() {
+    // The WR-01 FROM-clause walk must not break legitimate derived tables.
+    assert!(
+        guard_select_only("select * from (select * from data) sub").is_ok(),
+        "a read-only derived table must still be allowed after the WR-01 walk"
+    );
+}
+
+#[test]
+fn test_reject_select_into_in_cte() {
+    // The INTO hides in a CTE body, which the outer query's `body` never reaches.
+    let result = guard_select_only("with c as (select * into t from data) select * from c");
+    assert!(
+        result.is_err(),
+        "SELECT ... INTO inside a CTE body must be rejected — every cte_tables entry \
+         must be validated recursively (WR-04)"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Blocked: DML
 // ---------------------------------------------------------------------------

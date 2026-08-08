@@ -14,8 +14,8 @@
 //! Test 5 (IPC round-trip): `record_batches_to_ipc(&batches)` produces a non-empty `Vec<u8>`
 //!   that begins with the Arrow IPC magic bytes (decodable by an Arrow IPC reader).
 
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
 use datafusion::arrow::array::{Array, Float64Array, Int64Array, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
@@ -29,16 +29,46 @@ use parquet_lens_lib::storage::LocalFileSource;
 const LARGE_FIXTURE_PATH: &str = "tests/fixtures/large_sample.parquet";
 /// Path to the small test fixture (<100 rows).
 const SMALL_FIXTURE_PATH: &str = "tests/fixtures/sample.parquet";
+/// Path to the exactly-at-the-cap fixture (exactly ROW_CAP == 100 rows).
+const EXACT_100_FIXTURE_PATH: &str = "tests/fixtures/exact_100.parquet";
+
+// WR-04 (phase 02 review): fixture creation is synchronized on two levels.
+//
+// 1. Each `ensure_*` helper is guarded by a `OnceLock`, so this binary's parallel
+//    `#[tokio::test]` threads create a given fixture at most once. The old
+//    unsynchronized exists()-then-create let two tests both observe `!exists` and
+//    write the same path concurrently (`File::create` truncates), so a third test
+//    could open a half-written Parquet file and fail on the footer — a
+//    first-run/CI flake that vanished on retry.
+// 2. Each `create_*` writer emits to a unique temp sibling and atomically
+//    `fs::rename`s it into place, so no OTHER process (another test binary that
+//    shares a fixture, or a per-test-process runner) can ever observe a torn file.
+
+/// Returns a unique sibling temp path for `path` — same directory, therefore the
+/// same filesystem, so the final `fs::rename` into place is atomic (WR-04).
+fn unique_tmp_sibling(path: &Path) -> PathBuf {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    path.with_extension(format!("tmp-{}-{}", std::process::id(), nanos))
+}
 
 /// Creates a large Parquet fixture with 150 rows (3 columns: id Int64, label Utf8, score Float64).
 fn ensure_large_fixture() -> PathBuf {
-    let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(LARGE_FIXTURE_PATH);
+    static LARGE_FIXTURE: OnceLock<PathBuf> = OnceLock::new();
 
-    if !fixture_path.exists() {
-        create_large_fixture(&fixture_path);
-    }
-
-    fixture_path
+    LARGE_FIXTURE
+        .get_or_init(|| {
+            let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(LARGE_FIXTURE_PATH);
+            if !fixture_path.exists() {
+                create_large_fixture(&fixture_path);
+            }
+            fixture_path
+        })
+        .clone()
 }
 
 /// Writes a 150-row Parquet fixture for cap-related tests.
@@ -86,21 +116,99 @@ fn create_large_fixture(path: &PathBuf) {
     )
     .unwrap();
 
-    let file = File::create(path).unwrap();
+    // WR-04: write to a unique temp sibling, then atomically rename into place, so
+    // no concurrent reader (thread or process) can ever open a half-written file.
+    let tmp = unique_tmp_sibling(path);
+    let file = File::create(&tmp).unwrap();
     let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
     writer.write(&batch).unwrap();
     writer.close().unwrap();
+    std::fs::rename(&tmp, path).unwrap();
+}
+
+/// Creates a Parquet fixture holding EXACTLY 100 rows — the same count as the
+/// executor's `ROW_CAP`. Used to prove that a *complete* result which happens to
+/// land exactly on the cap is not reported as truncated (WR-06).
+///
+/// Same three columns as the large fixture (id Int64 non-null, label Utf8
+/// nullable, score Float64 nullable) so the two are interchangeable in queries.
+fn ensure_exact_100_fixture() -> PathBuf {
+    static EXACT_100_FIXTURE: OnceLock<PathBuf> = OnceLock::new();
+
+    EXACT_100_FIXTURE
+        .get_or_init(|| {
+            let fixture_path =
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(EXACT_100_FIXTURE_PATH);
+            if !fixture_path.exists() {
+                create_exact_100_fixture(&fixture_path);
+            }
+            fixture_path
+        })
+        .clone()
+}
+
+/// Writes a 100-row Parquet fixture for cap-accuracy tests.
+fn create_exact_100_fixture(path: &PathBuf) {
+    use datafusion::parquet::arrow::ArrowWriter;
+    use std::fs::File;
+
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("label", DataType::Utf8, true),
+        Field::new("score", DataType::Float64, true),
+    ]));
+
+    const ROW_COUNT: usize = 100;
+
+    let ids: Vec<i64> = (1..=ROW_COUNT as i64).collect();
+    let labels: Vec<Option<&str>> = (0..ROW_COUNT)
+        .map(|i| if i % 20 == 0 { None } else { Some("row") })
+        .collect();
+    let scores: Vec<Option<f64>> = (0..ROW_COUNT)
+        .map(|i| {
+            if i % 15 == 0 {
+                None
+            } else {
+                Some(i as f64 * 1.5)
+            }
+        })
+        .collect();
+
+    let id_arr = Arc::new(Int64Array::from(ids));
+    let label_arr = Arc::new(StringArray::from(labels));
+    let score_arr = Arc::new(Float64Array::from(scores));
+
+    let batch = RecordBatch::try_new(schema.clone(), vec![id_arr, label_arr, score_arr]).unwrap();
+
+    // WR-04: write to a unique temp sibling, then atomically rename into place, so
+    // no concurrent reader (thread or process) can ever open a half-written file.
+    let tmp = unique_tmp_sibling(path);
+    let file = File::create(&tmp).unwrap();
+    let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    std::fs::rename(&tmp, path).unwrap();
 }
 
 /// Returns the path to the small (5-row) fixture from Plan 01.
 fn small_fixture_path() -> PathBuf {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(SMALL_FIXTURE_PATH);
-    // The small fixture is created by Plan 01's storage_engine_tests.rs ensure_fixture().
-    // If it doesn't exist yet, create it here too.
-    if !path.exists() {
-        create_small_fixture(&path);
-    }
-    path
+    static SMALL_FIXTURE: OnceLock<PathBuf> = OnceLock::new();
+
+    SMALL_FIXTURE
+        .get_or_init(|| {
+            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(SMALL_FIXTURE_PATH);
+            // The small fixture is created by Plan 01's storage_engine_tests.rs
+            // ensure_fixture(). If it doesn't exist yet, create it here too — the
+            // temp-then-rename write keeps that cross-binary sharing torn-file-free
+            // (WR-04).
+            if !path.exists() {
+                create_small_fixture(&path);
+            }
+            path
+        })
+        .clone()
 }
 
 fn create_small_fixture(path: &PathBuf) {
@@ -133,10 +241,14 @@ fn create_small_fixture(path: &PathBuf) {
 
     let batch = RecordBatch::try_new(schema.clone(), vec![ids, names, values]).unwrap();
 
-    let file = File::create(path).unwrap();
+    // WR-04: write to a unique temp sibling, then atomically rename into place, so
+    // no concurrent reader (thread or process) can ever open a half-written file.
+    let tmp = unique_tmp_sibling(path);
+    let file = File::create(&tmp).unwrap();
     let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
     writer.write(&batch).unwrap();
     writer.close().unwrap();
+    std::fs::rename(&tmp, path).unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -235,6 +347,73 @@ async fn test_execute_limit_1000_still_caps_at_100() {
     assert!(
         meta.capped,
         "capped must be true when backend cap is hit regardless of query LIMIT"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// WR-06: `capped` means TRUNCATED, not "reached the cap"
+// ---------------------------------------------------------------------------
+
+/// A file whose entire content is exactly `ROW_CAP` rows produces a COMPLETE
+/// result — nothing was discarded, so `capped` must be false even though
+/// `total_rows` equals the cap (WR-06).
+#[tokio::test]
+async fn test_execute_exactly_100_rows_is_not_capped() {
+    let fixture_path = ensure_exact_100_fixture();
+    let source = LocalFileSource::new(fixture_path).expect("exact-100 fixture must exist");
+
+    let mut engine = QueryEngine::new();
+    engine
+        .register_source(&source)
+        .await
+        .expect("register_source must succeed");
+
+    let (meta, _ipc_bytes) = engine
+        .execute("select * from data")
+        .await
+        .expect("execute must succeed");
+
+    assert_eq!(
+        meta.total_rows, 100,
+        "the exact-100 fixture must return all 100 of its rows, got {}",
+        meta.total_rows
+    );
+    assert!(
+        !meta.capped,
+        "a COMPLETE result that lands exactly on the 100-row cap was not truncated — \
+         `capped` must stay false; it reports truncation, not cap-reached (WR-06)"
+    );
+}
+
+/// `limit 100` on a 150-row file is the app's own default query. The result is
+/// complete with respect to the query, so nothing was truncated by the backend
+/// cap and `capped` must be false (WR-06).
+#[tokio::test]
+async fn test_execute_limit_100_on_larger_file_is_not_capped() {
+    let fixture_path = ensure_large_fixture();
+    let source = LocalFileSource::new(fixture_path).expect("large fixture must exist");
+
+    let mut engine = QueryEngine::new();
+    engine
+        .register_source(&source)
+        .await
+        .expect("register_source must succeed");
+
+    let (meta, _ipc_bytes) = engine
+        .execute("select * from data limit 100")
+        .await
+        .expect("execute must succeed");
+
+    assert_eq!(
+        meta.total_rows, 100,
+        "`limit 100` must return exactly 100 rows, got {}",
+        meta.total_rows
+    );
+    assert!(
+        !meta.capped,
+        "`select * from data limit 100` yields a COMPLETE 100-row result — the backend \
+         discarded nothing, so `capped` must be false; a complete result at the cap is \
+         not truncated (WR-06)"
     );
 }
 
@@ -534,6 +713,591 @@ fn normalize_view_types_passthrough_non_view_batch() {
 }
 
 // ---------------------------------------------------------------------------
+// WR-05 / IN-01: view types must be normalized at EVERY nesting depth, and the
+// rewrite must preserve Arrow field- and schema-level metadata.
+// ---------------------------------------------------------------------------
+
+/// Recursively reports whether `dt` contains `Utf8View` or `BinaryView` at ANY depth.
+///
+/// apache-arrow JS v21 throws `"Unrecognized type: undefined (24)"` on a view type
+/// wherever it appears — a `List(Utf8View)` child blanks the grid exactly like a
+/// top-level `Utf8View` column does. Assertions therefore have to walk the whole tree,
+/// not just the top level (WR-05).
+fn contains_view_type(dt: &DataType) -> bool {
+    match dt {
+        DataType::Utf8View | DataType::BinaryView => true,
+        DataType::List(f)
+        | DataType::LargeList(f)
+        | DataType::ListView(f)
+        | DataType::LargeListView(f)
+        | DataType::FixedSizeList(f, _)
+        | DataType::Map(f, _) => contains_view_type(f.data_type()),
+        DataType::Struct(fields) => fields.iter().any(|f| contains_view_type(f.data_type())),
+        DataType::Dictionary(key, value) => {
+            contains_view_type(key) || contains_view_type(value)
+        }
+        DataType::RunEndEncoded(run_ends, values) => {
+            contains_view_type(run_ends.data_type()) || contains_view_type(values.data_type())
+        }
+        _ => false,
+    }
+}
+
+/// A `Struct` column with a `Utf8View` child must come back with a `Utf8` child,
+/// values intact (WR-05).
+#[test]
+fn normalize_view_types_downcasts_struct_child_utf8view() {
+    use datafusion::arrow::array::{Array, StringArray, StringViewArray, StructArray};
+    use datafusion::arrow::datatypes::Fields;
+
+    let inner_fields: Fields = vec![
+        Field::new("name", DataType::Utf8View, true),
+        Field::new("id", DataType::Int64, false),
+    ]
+    .into();
+
+    let name_child: Arc<dyn Array> =
+        Arc::new(StringViewArray::from(vec![Some("alice"), Some("bob"), None]));
+    let id_child: Arc<dyn Array> = Arc::new(Int64Array::from(vec![1i64, 2, 3]));
+
+    let struct_arr: Arc<dyn Array> = Arc::new(StructArray::new(
+        inner_fields.clone(),
+        vec![name_child, id_child],
+        None,
+    ));
+
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "person",
+        DataType::Struct(inner_fields),
+        false,
+    )]));
+
+    let batch = RecordBatch::try_new(schema, vec![struct_arr]).unwrap();
+    let result =
+        parquet_lens_lib::engine::executor::normalize_view_types(vec![batch]).unwrap();
+
+    assert_eq!(result.len(), 1, "must return one batch");
+    let out_field_type = result[0].schema().field(0).data_type().clone();
+
+    assert!(
+        !contains_view_type(&out_field_type),
+        "a Utf8View nested inside a Struct must be normalized away; got {:?}",
+        out_field_type
+    );
+
+    // The struct's string child must round-trip as a plain Utf8 array.
+    let out_struct = result[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .expect("column 0 must still be a StructArray");
+    let name_col = out_struct
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("struct child 0 must be a StringArray after normalization");
+    assert_eq!(name_col.value(0), "alice");
+    assert_eq!(name_col.value(1), "bob");
+    assert!(name_col.is_null(2), "null must survive the nested downcast");
+}
+
+/// `List(Utf8View)` must normalize to `List(Utf8)` with offsets and values intact (WR-05).
+#[test]
+fn normalize_view_types_downcasts_list_of_utf8view() {
+    use datafusion::arrow::array::{Array, ListArray, StringArray, StringViewArray};
+    use datafusion::arrow::buffer::OffsetBuffer;
+
+    let item_field = Arc::new(Field::new("item", DataType::Utf8View, true));
+
+    let values: Arc<dyn Array> = Arc::new(StringViewArray::from(vec![
+        Some("a"),
+        Some("b"),
+        Some("c"),
+        Some("d"),
+    ]));
+    // Two lists: ["a","b"] and ["c","d"].
+    let offsets = OffsetBuffer::new(vec![0i32, 2, 4].into());
+
+    let list_arr: Arc<dyn Array> = Arc::new(ListArray::new(
+        Arc::clone(&item_field),
+        offsets,
+        values,
+        None,
+    ));
+
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "tags",
+        DataType::List(Arc::clone(&item_field)),
+        false,
+    )]));
+
+    let batch = RecordBatch::try_new(schema, vec![list_arr]).unwrap();
+    let result =
+        parquet_lens_lib::engine::executor::normalize_view_types(vec![batch]).unwrap();
+
+    let out_field_type = result[0].schema().field(0).data_type().clone();
+    assert!(
+        !contains_view_type(&out_field_type),
+        "a Utf8View nested inside a List must be normalized away; got {:?}",
+        out_field_type
+    );
+
+    let out_list = result[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .expect("column 0 must still be a ListArray");
+    assert_eq!(out_list.len(), 2, "list offsets must be preserved");
+
+    let flat = out_list
+        .values()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("list values must be a StringArray after normalization");
+    let flat_values: Vec<&str> = (0..flat.len()).map(|i| flat.value(i)).collect();
+    assert_eq!(
+        flat_values,
+        vec!["a", "b", "c", "d"],
+        "flattened list values must be unchanged"
+    );
+}
+
+/// `Dictionary(Int32, Utf8View)` must normalize its VALUE type while keeping the
+/// key type (WR-05).
+#[test]
+fn normalize_view_types_downcasts_dictionary_value_utf8view() {
+    use datafusion::arrow::array::{Array, DictionaryArray, Int32Array, StringViewArray};
+
+    let keys = Int32Array::from(vec![0i32, 1, 0]);
+    let values: Arc<dyn Array> = Arc::new(StringViewArray::from(vec![Some("x"), Some("y")]));
+    let dict: Arc<dyn Array> = Arc::new(
+        DictionaryArray::<datafusion::arrow::datatypes::Int32Type>::try_new(
+            keys,
+            Arc::clone(&values),
+        )
+        .unwrap(),
+    );
+
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "code",
+        DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8View)),
+        false,
+    )]));
+
+    let batch = RecordBatch::try_new(schema, vec![dict]).unwrap();
+    let result =
+        parquet_lens_lib::engine::executor::normalize_view_types(vec![batch]).unwrap();
+
+    let out_field_type = result[0].schema().field(0).data_type().clone();
+    assert!(
+        !contains_view_type(&out_field_type),
+        "a Utf8View dictionary VALUE type must be normalized away; got {:?}",
+        out_field_type
+    );
+    assert_eq!(
+        out_field_type,
+        DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+        "the dictionary key type must be preserved and only the value type rewritten"
+    );
+}
+
+/// IN-01: the rewrite path must not silently drop Arrow metadata. A rewrite
+/// triggered by ONE view-typed column must leave every other field's metadata and
+/// the schema-level metadata intact.
+#[test]
+fn normalize_view_types_preserves_field_and_schema_metadata() {
+    use datafusion::arrow::array::{Array, StringViewArray};
+    use std::collections::HashMap;
+
+    let mut schema_meta = HashMap::new();
+    schema_meta.insert("file".to_string(), "fixture".to_string());
+
+    let mut field_meta = HashMap::new();
+    field_meta.insert("unit".to_string(), "count".to_string());
+
+    let id_field = Field::new("id", DataType::Int64, false).with_metadata(field_meta.clone());
+    // The view-typed field is what forces the rewrite path to run at all.
+    let name_field = Field::new("name", DataType::Utf8View, true);
+
+    let schema = Arc::new(Schema::new_with_metadata(
+        vec![id_field, name_field],
+        schema_meta.clone(),
+    ));
+
+    let id_arr: Arc<dyn Array> = Arc::new(Int64Array::from(vec![1i64, 2]));
+    let name_arr: Arc<dyn Array> =
+        Arc::new(StringViewArray::from(vec![Some("alice"), Some("bob")]));
+
+    let batch = RecordBatch::try_new(schema, vec![id_arr, name_arr]).unwrap();
+    let result =
+        parquet_lens_lib::engine::executor::normalize_view_types(vec![batch]).unwrap();
+
+    let out_schema = result[0].schema();
+
+    assert_eq!(
+        out_schema.metadata(),
+        &schema_meta,
+        "schema-level metadata must survive the view-type rewrite (IN-01)"
+    );
+    assert_eq!(
+        out_schema.field(0).metadata(),
+        &field_meta,
+        "field-level metadata on an UNCHANGED column must survive a rewrite \
+         triggered by a different column (IN-01)"
+    );
+    assert_eq!(
+        out_schema.field(1).data_type(),
+        &DataType::Utf8,
+        "the view-typed column must still be normalized"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1 Plan 01 Task 1: RunQueryResponse carries the QUERY RESULT schema
+// ---------------------------------------------------------------------------
+
+/// ROADMAP Success Criterion 4 (automated form): for `select * from data` the
+/// result schema reported by `execute()` must be field-for-field identical to the
+/// file schema reported by `get_schema()`.
+///
+/// Both labels are produced by the SAME `format!("{:?}", field.data_type())`
+/// expression (`context.rs::get_schema` and `executor.rs::execute`), so parity is
+/// true by construction for every Arrow type — including nested, dictionary,
+/// decimal, temporal and view types. This test pins that contract.
+#[tokio::test]
+async fn test_execute_result_schema_matches_file_schema_for_select_star() {
+    let fixture_path = small_fixture_path();
+    let source = LocalFileSource::new(fixture_path).expect("small fixture must exist");
+
+    let mut engine = QueryEngine::new();
+    engine
+        .register_source(&source)
+        .await
+        .expect("register_source must succeed");
+
+    let file_schema = engine.get_schema().expect("get_schema must succeed");
+
+    let (meta, _ipc_bytes) = engine
+        .execute("select * from data")
+        .await
+        .expect("execute must succeed");
+
+    assert_eq!(
+        meta.schema.len(),
+        file_schema.len(),
+        "ROADMAP Success Criterion 4: `select *` result schema must have the same \
+         column count as the file schema ({} result vs {} file)",
+        meta.schema.len(),
+        file_schema.len()
+    );
+
+    for (i, (result_field, file_field)) in meta.schema.iter().zip(file_schema.iter()).enumerate() {
+        assert_eq!(
+            result_field.name, file_field.name,
+            "ROADMAP Success Criterion 4: column {} name must match the file schema",
+            i
+        );
+        assert_eq!(
+            result_field.arrow_type, file_field.arrow_type,
+            "ROADMAP Success Criterion 4: column {} ('{}') arrow_type must be \
+             byte-identical to the file schema label — both must come from the same \
+             format!(\"{{:?}}\", data_type) expression",
+            i, file_field.name
+        );
+        assert_eq!(
+            result_field.nullable, file_field.nullable,
+            "ROADMAP Success Criterion 4: column {} ('{}') nullable must match the file schema",
+            i, file_field.name
+        );
+    }
+}
+
+/// RESULT-01/RESULT-03: an aggregate result reports its OWN column, not the file's.
+#[tokio::test]
+async fn test_execute_result_schema_for_count_star() {
+    let fixture_path = small_fixture_path();
+    let source = LocalFileSource::new(fixture_path).expect("small fixture must exist");
+
+    let mut engine = QueryEngine::new();
+    engine
+        .register_source(&source)
+        .await
+        .expect("register_source must succeed");
+
+    let (meta, _ipc_bytes) = engine
+        .execute("select count(*) from data")
+        .await
+        .expect("execute must succeed");
+
+    assert_eq!(
+        meta.schema.len(),
+        1,
+        "count(*) must produce exactly one result column, got {}",
+        meta.schema.len()
+    );
+    assert_eq!(
+        meta.schema[0].name, "count(*)",
+        "count(*) result column must carry DataFusion's raw output name"
+    );
+    assert_eq!(
+        meta.schema[0].arrow_type, "Int64",
+        "count(*) result column must be labelled Int64, not the source column's type"
+    );
+}
+
+/// RESULT-03: an aliased projection reports the alias, not the source column name.
+#[tokio::test]
+async fn test_execute_result_schema_for_alias() {
+    let fixture_path = small_fixture_path();
+    let source = LocalFileSource::new(fixture_path).expect("small fixture must exist");
+
+    let mut engine = QueryEngine::new();
+    engine
+        .register_source(&source)
+        .await
+        .expect("register_source must succeed");
+
+    let (meta, _ipc_bytes) = engine
+        .execute("select id as label from data")
+        .await
+        .expect("execute must succeed");
+
+    assert_eq!(
+        meta.schema.len(),
+        1,
+        "an aliased single-column projection must produce one result column, got {}",
+        meta.schema.len()
+    );
+    assert_eq!(
+        meta.schema[0].name, "label",
+        "the result column must carry the alias `label`, not the source column name"
+    );
+}
+
+/// The schema comes from the executed stream, not from the retained batches —
+/// so a zero-row result still knows its columns and the grid can render headers.
+#[tokio::test]
+async fn test_execute_result_schema_present_for_empty_result() {
+    let fixture_path = small_fixture_path();
+    let source = LocalFileSource::new(fixture_path).expect("small fixture must exist");
+
+    let mut engine = QueryEngine::new();
+    engine
+        .register_source(&source)
+        .await
+        .expect("register_source must succeed");
+
+    let (meta, _ipc_bytes) = engine
+        .execute("select * from data where id < 0")
+        .await
+        .expect("execute must succeed");
+
+    assert_eq!(
+        meta.total_rows, 0,
+        "an always-false predicate must return zero rows, got {}",
+        meta.total_rows
+    );
+    assert!(
+        !meta.schema.is_empty(),
+        "a zero-row result must still carry a fully populated result schema"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// WR-04 layer 2: plan-level backstop (SQLOptions) inside the executor
+//
+// These tests call `execute` DIRECTLY, deliberately bypassing `guard_select_only`.
+// That is the whole point: layer 1 lives in commands/query.rs, and this layer must
+// hold on its own for anything that reaches the engine another way.
+// ---------------------------------------------------------------------------
+
+/// `SELECT ... INTO` must be refused at PLAN level and must leave no session table
+/// behind (WR-04).
+///
+/// The second assertion is the decisive one: DataFusion plans `SELECT ... INTO` as
+/// `CreateMemoryTable`, so without the `SQLOptions` backstop the statement executes
+/// and a subsequent `select * from t` SUCCEEDS against the table it created.
+#[tokio::test]
+async fn test_execute_rejects_select_into_at_plan_level() {
+    let fixture_path = small_fixture_path();
+    let source = LocalFileSource::new(fixture_path).expect("small fixture must exist");
+
+    let mut engine = QueryEngine::new();
+    engine
+        .register_source(&source)
+        .await
+        .expect("register_source must succeed");
+
+    let result = engine.execute("select * into t from data").await;
+
+    assert!(
+        result.is_err(),
+        "SELECT ... INTO plans as CreateMemoryTable and must be rejected at plan level (WR-04)"
+    );
+    let msg = result.err().unwrap_or_default();
+    assert!(
+        msg.contains("SQL planning error"),
+        "the rejection must surface through the existing planning-error wrapper so the \
+         frontend error surface is unchanged; got '{msg}'"
+    );
+
+    // Decisive: no session table may have been created by the rejected statement.
+    let follow_up = engine.execute("select * from t").await;
+    assert!(
+        follow_up.is_err(),
+        "the rejected SELECT ... INTO must NOT have created a session table `t` — \
+         a successful `select * from t` proves the DDL side effect happened (WR-04)"
+    );
+}
+
+/// The `SQLOptions` backstop must not narrow what ordinary read-only SQL can do:
+/// aggregates still plan, execute and report their own result schema.
+#[tokio::test]
+async fn test_execute_select_still_works_with_sql_options() {
+    let fixture_path = small_fixture_path();
+    let source = LocalFileSource::new(fixture_path).expect("small fixture must exist");
+
+    let mut engine = QueryEngine::new();
+    engine
+        .register_source(&source)
+        .await
+        .expect("register_source must succeed");
+
+    let (meta, _ipc_bytes) = engine
+        .execute("select count(*) from data")
+        .await
+        .expect("an aggregate SELECT must still execute under sql_with_options");
+
+    assert_eq!(
+        meta.total_rows, 1,
+        "count(*) must return exactly one row, got {}",
+        meta.total_rows
+    );
+    assert_eq!(
+        meta.schema.len(),
+        1,
+        "count(*) must report exactly one result-schema field, got {}",
+        meta.schema.len()
+    );
+    assert_eq!(
+        meta.schema[0].arrow_type, "Int64",
+        "the count(*) result column must still be labelled Int64 under sql_with_options"
+    );
+}
+
+/// A CTE is a read-only construct and must survive the backstop unchanged.
+#[tokio::test]
+async fn test_execute_cte_still_works_with_sql_options() {
+    let fixture_path = small_fixture_path();
+    let source = LocalFileSource::new(fixture_path).expect("small fixture must exist");
+
+    let mut engine = QueryEngine::new();
+    engine
+        .register_source(&source)
+        .await
+        .expect("register_source must succeed");
+
+    let (meta, _ipc_bytes) = engine
+        .execute("with c as (select * from data) select count(*) from c")
+        .await
+        .expect("a read-only CTE must still execute under sql_with_options");
+
+    assert_eq!(
+        meta.total_rows, 1,
+        "the CTE aggregate must return exactly one row, got {}",
+        meta.total_rows
+    );
+}
+
+// ---------------------------------------------------------------------------
+// WR-02 (phase 02 review): a stream error during the CAP PEEK must not fail an
+// already-complete 100-row result.
+// ---------------------------------------------------------------------------
+
+/// A `PartitionStream` that yields one exactly-at-the-cap batch and then a stream
+/// error — the precise shape where the executor's peek loop observes an error in
+/// a batch it would have DROPPED anyway.
+#[derive(Debug)]
+struct ErrAfterCapStream {
+    schema: datafusion::arrow::datatypes::SchemaRef,
+}
+
+impl datafusion::physical_plan::streaming::PartitionStream for ErrAfterCapStream {
+    fn schema(&self) -> &datafusion::arrow::datatypes::SchemaRef {
+        &self.schema
+    }
+
+    fn execute(
+        &self,
+        _ctx: Arc<datafusion::execution::TaskContext>,
+    ) -> datafusion::execution::SendableRecordBatchStream {
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+
+        let ids: Arc<dyn Array> = Arc::new(Int64Array::from((1..=100i64).collect::<Vec<_>>()));
+        let batch = RecordBatch::try_new(Arc::clone(&self.schema), vec![ids])
+            .expect("cap-sized batch must build");
+
+        let items = vec![
+            Ok(batch),
+            Err(datafusion::error::DataFusionError::Execution(
+                "simulated corruption past the cap".to_string(),
+            )),
+        ];
+        Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&self.schema),
+            futures::stream::iter(items),
+        ))
+    }
+}
+
+/// The slice branch never observes errors past the cap (it breaks immediately),
+/// so the peek branch must not fail on them either — the same data with the same
+/// corruption past row 100 must not succeed or fail depending only on how the
+/// source chunked its batches. The peek error is treated as end-of-stream and
+/// `capped` is reported `true` conservatively (WR-02).
+#[tokio::test]
+async fn test_execute_peek_error_past_cap_does_not_fail_result() {
+    use datafusion::catalog::streaming::StreamingTable;
+
+    let schema: datafusion::arrow::datatypes::SchemaRef =
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+
+    let table = StreamingTable::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(ErrAfterCapStream {
+            schema: Arc::clone(&schema),
+        })],
+    )
+    .expect("StreamingTable::try_new must succeed");
+
+    let mut engine = QueryEngine::new();
+    engine
+        .ctx()
+        .register_table("err_data", Arc::new(table))
+        .expect("register_table must succeed");
+
+    let (meta, ipc_bytes) = engine.execute("select * from err_data").await.expect(
+        "an error in a batch past the cap must not discard the 100 already-retained \
+         rows (WR-02)",
+    );
+
+    assert_eq!(
+        meta.total_rows, 100,
+        "all 100 retained rows must survive the peek error, got {}",
+        meta.total_rows
+    );
+    assert!(
+        meta.capped,
+        "capped must be reported true conservatively when the peek hits an error — \
+         completeness cannot be proven (WR-02)"
+    );
+    assert!(
+        !ipc_bytes.is_empty(),
+        "IPC bytes must be non-empty for the retained 100-row result"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Bonus: get_page returns correct slice from cached result
 // ---------------------------------------------------------------------------
 
@@ -575,4 +1339,59 @@ async fn test_get_page_slices_from_cached_result() {
         last_page.rows.len()
     );
     assert!(!last_page.has_more, "has_more must be false at the end of the 100-row cache");
+}
+
+/// WR-03 (phase 02 review): duplicate result column names must NOT collapse into
+/// one JSON key. `select id, value as id` used to serialize both columns under the
+/// key `"id"`, and `serde_json` kept only the last one — silently dropping a
+/// column. The page channel must expose the same positional `__N` dedupe scheme
+/// as the frontend's `dedupeFieldKeys` (D-PH1-03).
+#[tokio::test]
+async fn test_get_page_disambiguates_duplicate_column_names() {
+    let fixture_path = small_fixture_path();
+    let source = LocalFileSource::new(fixture_path).expect("small fixture must exist");
+
+    let mut engine = QueryEngine::new();
+    engine
+        .register_source(&source)
+        .await
+        .expect("register_source must succeed");
+
+    // Two result columns BOTH named `id`: a self-join projects `a.id` and `b.id`,
+    // whose FIELD names are identical — the exact shape the frontend's
+    // `dedupeFieldKeys` was built for. The offset join condition makes the two
+    // columns carry DIFFERENT values (1 vs 2), so the assertions can prove which
+    // column each key resolves to (small fixture: id=1..5).
+    engine
+        .execute(
+            "select a.id, b.id from data a \
+             join data b on b.id = a.id + 1 where a.id = 1",
+        )
+        .await
+        .expect("execute must succeed");
+
+    let page = engine.get_page(0, 5).expect("get_page must succeed");
+    assert_eq!(page.rows.len(), 1, "the id=1 predicate must match exactly one row");
+
+    let row = page.rows[0]
+        .as_object()
+        .expect("each page row must be a JSON object");
+
+    assert_eq!(
+        row.get("id"),
+        Some(&serde_json::json!(1)),
+        "the FIRST duplicate column keeps its raw name and its own values (WR-03)"
+    );
+    assert_eq!(
+        row.get("id__2"),
+        Some(&serde_json::json!(2)),
+        "the SECOND duplicate column must survive under the deduped key `id__2` — \
+         not silently overwrite (or be overwritten by) the first (WR-03)"
+    );
+    assert_eq!(
+        row.len(),
+        2,
+        "exactly two keys must be present for two result columns, got {:?}",
+        row.keys().collect::<Vec<_>>()
+    );
 }

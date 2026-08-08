@@ -16,12 +16,13 @@
 use std::sync::Arc;
 
 use datafusion::arrow::array::RecordBatch;
-use datafusion::arrow::compute::{cast, concat_batches};
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::arrow::compute::{can_cast_types, cast, concat_batches};
+use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
+use datafusion::execution::context::SQLOptions;
 use futures::StreamExt;
 
 use crate::engine::QueryEngine;
-use crate::ipc::{PageResponse, RunQueryResponse};
+use crate::ipc::{PageResponse, RunQueryResponse, SchemaField};
 use crate::ipc::serializer::record_batches_to_ipc;
 
 /// Maximum number of rows the executor will retain from any single query execution.
@@ -35,11 +36,24 @@ impl QueryEngine {
     ///
     /// # Behavior
     ///
-    /// 1. Builds a `DataFrame` via `SessionContext::sql`.
+    /// 1. Builds a `DataFrame` via `SessionContext::sql_with_options` with DDL, DML and
+    ///    statements all disallowed — the plan-level backstop behind the AST guard in
+    ///    `commands/query.rs` (WR-04).
     /// 2. Streams batches via `execute_stream()` — never `collect()` (PITFALLS.md §Pitfall 1).
-    /// 3. Accumulates rows until `ROW_CAP` is hit; slices the final batch to fit exactly.
-    /// 4. Serializes retained batches to Arrow IPC bytes via `record_batches_to_ipc`.
-    /// 5. Caches the retained batches for `get_page`.
+    /// 3. Captures the RESULT schema from the stream, before draining it, so the frontend
+    ///    can build grid columns from the result rather than the opened file (D-PH1-01).
+    /// 4. Accumulates rows until `ROW_CAP` is hit; slices the final batch to fit exactly.
+    /// 5. Serializes retained batches to Arrow IPC bytes via `record_batches_to_ipc`.
+    /// 6. Caches the retained batches for `get_page`.
+    ///
+    /// # The `capped` flag
+    ///
+    /// `capped` means **"the result was truncated"** — not "the result reached the cap".
+    /// A complete result of exactly `ROW_CAP` rows (e.g. `select * from data limit 100`,
+    /// the app's own default query) reports `capped: false`, because the backend discarded
+    /// nothing. It is set only when rows were provably dropped: either the final batch had
+    /// to be sliced, or a bounded peek found another non-empty batch waiting in the stream
+    /// (WR-06).
     ///
     /// `result_cache` (the `Vec<serde_json::Value>` field from Plan 01) is cleared on each call.
     pub async fn execute(&mut self, sql: &str) -> Result<(RunQueryResponse, Vec<u8>), String> {
@@ -48,9 +62,21 @@ impl QueryEngine {
         self.result_batch_cache = None;
         self.last_query_meta = None;
 
+        // Defence in depth for WR-04. `sql_with_options` runs `verify_plan` over the
+        // built `LogicalPlan` and rejects `Ddl`, `Dml`, `Copy` and `Statement` nodes, so a
+        // write-shaped plan — `CreateMemoryTable` from `SELECT ... INTO`, or any future
+        // write-shaped construct — is refused at PLAN level even if the AST guard in
+        // `commands/query.rs` is ever bypassed, including on a direct IPC call that reaches
+        // the engine another way. All three flags default to `true`, so each one must be
+        // set explicitly; omitting any of them silently restores the hole.
+        let opts = SQLOptions::new()
+            .with_allow_ddl(false)
+            .with_allow_dml(false)
+            .with_allow_statements(false);
+
         let df = self
             .ctx()
-            .sql(sql)
+            .sql_with_options(sql, opts)
             .await
             .map_err(|e| format!("SQL planning error: {}", e))?;
 
@@ -58,6 +84,30 @@ impl QueryEngine {
             .execute_stream()
             .await
             .map_err(|e| format!("Failed to start query stream: {}", e))?;
+
+        // Capture the RESULT schema before the 'drain loop consumes the stream.
+        //
+        // This is taken PRE-normalization on purpose: `normalize_view_types` below
+        // downcasts Utf8View→Utf8 (and BinaryView→Binary) purely so apache-arrow JS v21
+        // can decode the IPC bytes, while `get_schema` reports the file's UN-normalized
+        // types. Labelling from the normalized schema would make a natively-view-typed
+        // column read `Utf8View` in the sidebar but `Utf8` in the grid (D-PH1-02).
+        //
+        // Reading the schema from the stream (rather than the retained batches) also means
+        // a zero-row result still reports its full column list.
+        let result_schema = stream.schema();
+        let schema: Vec<SchemaField> = result_schema
+            .fields()
+            .iter()
+            .map(|field| SchemaField {
+                name: field.name().clone(),
+                // MUST stay character-for-character identical to the expression in
+                // `context.rs::get_schema` — otherwise `select *` grid headers would
+                // diverge from the sidebar's file-schema labels (D-PH1-01).
+                arrow_type: format!("{:?}", field.data_type()),
+                nullable: field.is_nullable(),
+            })
+            .collect();
 
         let mut retained_batches: Vec<RecordBatch> = Vec::new();
         let mut total_rows: usize = 0;
@@ -89,7 +139,40 @@ impl QueryEngine {
             }
 
             if total_rows >= ROW_CAP {
-                capped = true;
+                // We filled to exactly ROW_CAP without discarding anything. Whether the
+                // result is TRUNCATED depends on whether the stream still has rows, so
+                // peek before claiming it (WR-06). Zero-row batches are skipped because a
+                // stream may legitimately emit trailing empty batches before ending —
+                // those carry no rows and therefore prove no truncation.
+                //
+                // This is not a materialization violation (PITFALLS.md §Pitfall 1 holds):
+                // the peek pulls at most the already-scheduled next batches, stops at the
+                // first non-empty one, and DROPS every batch it pulls. Nothing peeked is
+                // ever pushed into `retained_batches`, so `total_rows` stays exactly
+                // ROW_CAP and the full result is still never accumulated.
+                let mut more = false;
+                while let Some(peeked_result) = stream.next().await {
+                    let peeked = match peeked_result {
+                        Ok(batch) => batch,
+                        Err(_) => {
+                            // WR-02 (phase 02 review): rows past the cap would have been
+                            // DROPPED regardless, so an error reading them cannot invalidate
+                            // the 100 rows already retained — the slice branch above never
+                            // even observes errors past the cap, and the two paths must not
+                            // succeed or fail differently depending only on how the source
+                            // chunked its batches. Report capped=true conservatively: we
+                            // cannot prove the result was complete.
+                            more = true;
+                            break;
+                        }
+                    };
+                    if peeked.num_rows() > 0 {
+                        more = true;
+                        break;
+                    }
+                }
+
+                capped = more;
                 break 'drain;
             }
         }
@@ -116,6 +199,7 @@ impl QueryEngine {
         let response = RunQueryResponse {
             total_rows,
             capped,
+            schema,
         };
 
         // Cache the metadata so `get_last_result_meta` can retrieve the authoritative `capped` flag.
@@ -182,21 +266,41 @@ impl QueryEngine {
 ///
 /// # Mapping
 ///
+/// The rewrite applies at **every nesting depth**, not only at the top level (WR-05).
+/// A `List(Utf8View)` child blanks the grid exactly like a top-level `Utf8View` column
+/// does, so a top-level-only match would leave the stated guarantee false.
+///
 /// | Source type      | Target type  |
 /// |------------------|--------------|
 /// | `Utf8View`       | `Utf8`       |
 /// | `BinaryView`     | `Binary`     |
 /// | everything else  | unchanged    |
 ///
+/// Container types are recursed into and rebuilt around their rewritten children:
+/// `List`, `LargeList`, `ListView`, `LargeListView`, `FixedSizeList` (size preserved),
+/// `Struct` (unchanged children kept as-is), `Map` (`sorted` flag preserved),
+/// `Dictionary` (key type preserved, value type rewritten) and `RunEndEncoded`.
+///
+/// # Metadata
+///
+/// Field-level and schema-level Arrow metadata survive the rewrite (IN-01): fields are
+/// rebuilt with `Field::with_data_type` (which keeps name, nullability AND metadata) and
+/// the schema with `Schema::new_with_metadata`.  Previously a rewrite triggered by one
+/// view column silently stripped metadata from every other column too.
+///
 /// # Fast path
 ///
-/// If no column in `batches[0].schema()` is a view type the input `Vec` is returned
-/// unchanged — no allocation, no casting.
+/// If no column in `batches[0].schema()` contains a view type at any depth the input
+/// `Vec` is returned unchanged — no allocation, no casting.
 ///
 /// # Errors
 ///
-/// Returns `Err(String)` if Arrow's `cast` kernel fails or if `RecordBatch::try_new`
-/// rejects the rebuilt batch.  Never panics.
+/// Returns `Err(String)` if the Arrow cast kernel does not support a required cast
+/// (checked up-front with `can_cast_types`, naming the column and both types), if the
+/// `cast` kernel itself fails, or if `RecordBatch::try_new` rejects the rebuilt batch.
+/// Failing loudly is deliberate: silently shipping a view-typed column produces
+/// `"Unrecognized type: undefined (24)"` in apache-arrow JS v21 and an empty grid with
+/// no explanation.  Never panics.
 pub fn normalize_view_types(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>, String> {
     if batches.is_empty() {
         return Ok(Vec::new());
@@ -204,33 +308,31 @@ pub fn normalize_view_types(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch
 
     let orig_schema = batches[0].schema();
 
-    // Build the list of target field types, mapping view types to non-view equivalents.
+    // Build the target fields, rewriting view types at any depth.
+    // `view_free_field` returns None when the field is already view-free.
     let mut any_changed = false;
     let new_fields: Vec<Field> = orig_schema
         .fields()
         .iter()
-        .map(|f| {
-            let target_dt = match f.data_type() {
-                DataType::Utf8View => {
-                    any_changed = true;
-                    DataType::Utf8
-                }
-                DataType::BinaryView => {
-                    any_changed = true;
-                    DataType::Binary
-                }
-                other => other.clone(),
-            };
-            Field::new(f.name(), target_dt, f.is_nullable())
+        .map(|f| match view_free_field(f) {
+            Some(rewritten) => {
+                any_changed = true;
+                rewritten
+            }
+            None => f.as_ref().clone(),
         })
         .collect();
 
-    // Fast path: no view-typed columns found.
+    // Fast path: no view-typed columns found at any depth.
     if !any_changed {
         return Ok(batches);
     }
 
-    let new_schema: SchemaRef = Arc::new(Schema::new(new_fields));
+    // new_with_metadata (not Schema::new) so schema-level key/value pairs survive (IN-01).
+    let new_schema: SchemaRef = Arc::new(Schema::new_with_metadata(
+        new_fields,
+        orig_schema.metadata().clone(),
+    ));
 
     // Rebuild each batch, casting only the columns whose type changed.
     batches
@@ -244,6 +346,16 @@ pub fn normalize_view_types(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch
                     let col = batch.column(i);
                     let target_dt = new_schema.field(i).data_type();
                     if target_dt != f.data_type() {
+                        // Guard before casting: an unsupported nested cast must surface as
+                        // a named error, never as undecodable IPC bytes on the wire.
+                        if !can_cast_types(f.data_type(), target_dt) {
+                            return Err(format!(
+                                "cannot normalize view type on column '{}': no Arrow cast from {:?} to {:?}",
+                                f.name(),
+                                f.data_type(),
+                                target_dt
+                            ));
+                        }
                         cast(col.as_ref(), target_dt)
                             .map_err(|e| format!("cast error on column '{}': {}", f.name(), e))
                     } else {
@@ -259,9 +371,89 @@ pub fn normalize_view_types(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch
         .collect()
 }
 
+/// Returns the view-free rewrite of `dt`, or `None` when `dt` already contains no
+/// view type at any depth.
+///
+/// `None` (rather than an unconditional clone) is what powers the fast path in
+/// `normalize_view_types`: an unchanged type costs no allocation and no cast.
+fn view_free_data_type(dt: &DataType) -> Option<DataType> {
+    match dt {
+        DataType::Utf8View => Some(DataType::Utf8),
+        DataType::BinaryView => Some(DataType::Binary),
+
+        // Single-child list containers: rebuild the same variant around the rewritten child.
+        DataType::List(f) => view_free_field(f).map(|nf| DataType::List(Arc::new(nf))),
+        DataType::LargeList(f) => view_free_field(f).map(|nf| DataType::LargeList(Arc::new(nf))),
+        DataType::ListView(f) => view_free_field(f).map(|nf| DataType::ListView(Arc::new(nf))),
+        DataType::LargeListView(f) => {
+            view_free_field(f).map(|nf| DataType::LargeListView(Arc::new(nf)))
+        }
+        // Fixed size must be carried over verbatim.
+        DataType::FixedSizeList(f, size) => {
+            view_free_field(f).map(|nf| DataType::FixedSizeList(Arc::new(nf), *size))
+        }
+
+        // Struct: rebuild only if at least one child changed; unchanged children are
+        // reused by Arc clone so their metadata is untouched.
+        DataType::Struct(fields) => {
+            let mut any_changed = false;
+            let new_fields: Vec<FieldRef> = fields
+                .iter()
+                .map(|f| match view_free_field(f) {
+                    Some(rewritten) => {
+                        any_changed = true;
+                        Arc::new(rewritten)
+                    }
+                    None => Arc::clone(f),
+                })
+                .collect();
+
+            if any_changed {
+                Some(DataType::Struct(new_fields.into()))
+            } else {
+                None
+            }
+        }
+
+        // Map: the `sorted` flag is part of the type and must be preserved.
+        DataType::Map(entries, sorted) => {
+            view_free_field(entries).map(|nf| DataType::Map(Arc::new(nf), *sorted))
+        }
+
+        // Dictionary: only the value type can be a view type; keep the key type as-is.
+        DataType::Dictionary(key, value) => view_free_data_type(value)
+            .map(|nv| DataType::Dictionary(key.clone(), Box::new(nv))),
+
+        DataType::RunEndEncoded(run_ends, values) => view_free_field(values)
+            .map(|nf| DataType::RunEndEncoded(Arc::clone(run_ends), Arc::new(nf))),
+
+        _ => None,
+    }
+}
+
+/// Returns the view-free rewrite of `f`, or `None` when its type is already view-free.
+///
+/// Uses `Field::with_data_type` specifically: it preserves the field's name, nullability
+/// AND metadata.  The previous `Field::new(f.name(), dt, f.is_nullable())` construction
+/// silently dropped field metadata (IN-01).
+fn view_free_field(f: &Field) -> Option<Field> {
+    view_free_data_type(f.data_type()).map(|new_dt| f.clone().with_data_type(new_dt))
+}
+
 /// Converts a `RecordBatch` into a `Vec<serde_json::Value>` row objects.
 ///
 /// Uses DataFusion's Arrow JSON writer re-export (PITFALLS.md §Pitfall 3).
+///
+/// # Duplicate column names (phase 02 review, WR-03)
+///
+/// `ArrayWriter` keys cells by the raw column name, so a result with duplicate
+/// names — `select a, b as a from data` — produced JSON objects with duplicate
+/// keys, and `serde_json` kept only the LAST occurrence: one column's values
+/// silently replaced the other's. Column names are therefore disambiguated
+/// positionally BEFORE serialization, with the same `__N`-suffix scheme the
+/// frontend applies to the Arrow IPC channel (`dedupeFieldKeys` in
+/// `src/lib/tauri.ts`, D-PH1-03), so both row channels expose duplicate columns
+/// identically instead of dropping data.
 fn record_batch_to_json_rows(
     batch: &RecordBatch,
 ) -> Result<Vec<serde_json::Value>, String> {
@@ -271,11 +463,37 @@ fn record_batch_to_json_rows(
         return Ok(Vec::new());
     }
 
+    // Rebuild the batch under deduped column names when (and only when) the
+    // result schema contains duplicates (WR-03). Types, nullability, metadata
+    // and the column arrays themselves are untouched — only names change.
+    let schema = batch.schema();
+    let names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+    let deduped = dedupe_field_names(&names);
+
+    let renamed_batch: RecordBatch;
+    let write_batch: &RecordBatch = if deduped == names {
+        batch
+    } else {
+        let new_fields: Vec<Field> = schema
+            .fields()
+            .iter()
+            .zip(deduped.iter())
+            .map(|(f, name)| f.as_ref().clone().with_name(name))
+            .collect();
+        let new_schema = Arc::new(Schema::new_with_metadata(
+            new_fields,
+            schema.metadata().clone(),
+        ));
+        renamed_batch = RecordBatch::try_new(new_schema, batch.columns().to_vec())
+            .map_err(|e| format!("Failed to rebuild page batch with deduped names: {}", e))?;
+        &renamed_batch
+    };
+
     let mut buf = Vec::new();
     {
         let mut writer = ArrayWriter::new(&mut buf);
         writer
-            .write(batch)
+            .write(write_batch)
             .map_err(|e| format!("JSON write error: {}", e))?;
         writer
             .finish()
@@ -286,4 +504,39 @@ fn record_batch_to_json_rows(
         serde_json::from_slice(&buf).map_err(|e| format!("JSON parse error: {}", e))?;
 
     Ok(rows)
+}
+
+/// Returns positionally deduped column names: the first occurrence of a name is
+/// kept verbatim, later occurrences get `__2`, `__3`, ... suffixes, probing
+/// forward when a source column literally carries an already-taken probed name.
+///
+/// MUST stay behaviourally identical to `dedupeFieldKeys` in `src/lib/tauri.ts`
+/// (D-PH1-03): the frontend applies this scheme to the Arrow IPC channel, and the
+/// `get_page` JSON channel must expose the same keys for the same result (WR-03).
+fn dedupe_field_names(names: &[String]) -> Vec<String> {
+    use std::collections::{HashMap, HashSet};
+
+    // Occurrence counter per source name, and every key already handed out.
+    let mut seen: HashMap<&str, usize> = HashMap::new();
+    let mut used: HashSet<String> = HashSet::new();
+
+    names
+        .iter()
+        .map(|name| {
+            let mut count = seen.get(name.as_str()).copied().unwrap_or(0) + 1;
+            let mut key = if count == 1 {
+                name.clone()
+            } else {
+                format!("{name}__{count}")
+            };
+            // Probe forward: a source column may literally be named `{name}__{count}`.
+            while used.contains(&key) {
+                count += 1;
+                key = format!("{name}__{count}");
+            }
+            seen.insert(name.as_str(), count);
+            used.insert(key.clone());
+            key
+        })
+        .collect()
 }

@@ -6,7 +6,8 @@
  * Both now consume this single hook.
  *
  * Gating (D-03/LOAD-02): the handler is a no-op unless a file is registered
- * and no query is already in flight — this guards Ctrl+Enter, which would
+ * and no query is already in flight — this guards the run shortcut (Mod-Enter:
+ * Cmd+Enter on macOS, Ctrl+Enter elsewhere), which would
  * otherwise bypass the disabled button and query an unregistered table.
  */
 import { useCallback } from "react";
@@ -41,7 +42,7 @@ export function useRunQuery() {
       const result = await runQuery(queryText);
       // Successful run: clear any prior inline error before setting results (D-01).
       setQueryError(null);
-      setResults(result.total_rows, result.capped, result.rows);
+      setResults(result.total_rows, result.capped, result.rows, result.schema);
     } catch (err) {
       // Surface the engine's verbatim error inline below the editor (QUERY-04 / D-03).
       setQueryError(err instanceof Error ? err.message : String(err));

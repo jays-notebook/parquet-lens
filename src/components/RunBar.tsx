@@ -1,5 +1,6 @@
 /**
- * Run bar — 40px bar with the Run Query button and Ctrl+Enter shortcut hint.
+ * Run bar — 40px bar with the Run Query button and the platform-aware run
+ * shortcut hint (⌘+Enter on macOS, Ctrl+Enter elsewhere — see @/lib/platform).
  *
  * While isLoading:
  *   - Button is disabled (--muted fill, --muted-foreground text, cursor: not-allowed).
@@ -13,6 +14,7 @@ import { Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useAppStore } from "@/store/appStore";
 import { useRunQuery } from "@/hooks/useRunQuery";
+import { getRunShortcut } from "@/lib/platform";
 
 export function RunBar() {
   const { isLoading, registrationStatus } = useAppStore(useShallow((s) => ({
@@ -23,6 +25,10 @@ export function RunBar() {
 
   // Shared run-query handler (WR-01) — same implementation SqlEditor's onRun uses.
   const { runQueryHandler: handleRun } = useRunQuery();
+
+  // Plain call, no useMemo: a two-branch string lookup, and the host platform
+  // cannot change during the app's lifetime.
+  const shortcut = getRunShortcut();
 
   return (
     <div
@@ -70,8 +76,10 @@ export function RunBar() {
         Run Query
       </Button>
 
-      {/* Ctrl+Enter shortcut hint — grays out when Run is inactive (UI-SPEC.md §RunBar) */}
+      {/* Run shortcut hint (⌘+Enter on macOS, Ctrl+Enter elsewhere) — grays out
+          when Run is inactive (UI-SPEC.md §RunBar) */}
       <span
+        aria-label={shortcut.ariaLabel}
         style={{
           fontSize: "12px",
           // Phase 4: gray out hint when not registered OR loading — shortcut is non-functional.
@@ -81,7 +89,7 @@ export function RunBar() {
           userSelect: "none",
         }}
       >
-        Ctrl+Enter
+        {shortcut.label}
       </span>
     </div>
   );
