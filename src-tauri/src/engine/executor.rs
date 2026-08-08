@@ -43,6 +43,15 @@ impl QueryEngine {
     /// 5. Serializes retained batches to Arrow IPC bytes via `record_batches_to_ipc`.
     /// 6. Caches the retained batches for `get_page`.
     ///
+    /// # The `capped` flag
+    ///
+    /// `capped` means **"the result was truncated"** — not "the result reached the cap".
+    /// A complete result of exactly `ROW_CAP` rows (e.g. `select * from data limit 100`,
+    /// the app's own default query) reports `capped: false`, because the backend discarded
+    /// nothing. It is set only when rows were provably dropped: either the final batch had
+    /// to be sliced, or a bounded peek found another non-empty batch waiting in the stream
+    /// (WR-06).
+    ///
     /// `result_cache` (the `Vec<serde_json::Value>` field from Plan 01) is cleared on each call.
     pub async fn execute(&mut self, sql: &str) -> Result<(RunQueryResponse, Vec<u8>), String> {
         // Clear caches from any prior execution.
@@ -115,7 +124,27 @@ impl QueryEngine {
             }
 
             if total_rows >= ROW_CAP {
-                capped = true;
+                // We filled to exactly ROW_CAP without discarding anything. Whether the
+                // result is TRUNCATED depends on whether the stream still has rows, so
+                // peek before claiming it (WR-06). Zero-row batches are skipped because a
+                // stream may legitimately emit trailing empty batches before ending —
+                // those carry no rows and therefore prove no truncation.
+                //
+                // This is not a materialization violation (PITFALLS.md §Pitfall 1 holds):
+                // the peek pulls at most the already-scheduled next batches, stops at the
+                // first non-empty one, and DROPS every batch it pulls. Nothing peeked is
+                // ever pushed into `retained_batches`, so `total_rows` stays exactly
+                // ROW_CAP and the full result is still never accumulated.
+                let mut more = false;
+                while let Some(peeked_result) = stream.next().await {
+                    let peeked = peeked_result.map_err(|e| format!("Stream error: {}", e))?;
+                    if peeked.num_rows() > 0 {
+                        more = true;
+                        break;
+                    }
+                }
+
+                capped = more;
                 break 'drain;
             }
         }
