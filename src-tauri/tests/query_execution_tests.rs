@@ -660,6 +660,246 @@ fn normalize_view_types_passthrough_non_view_batch() {
 }
 
 // ---------------------------------------------------------------------------
+// WR-05 / IN-01: view types must be normalized at EVERY nesting depth, and the
+// rewrite must preserve Arrow field- and schema-level metadata.
+// ---------------------------------------------------------------------------
+
+/// Recursively reports whether `dt` contains `Utf8View` or `BinaryView` at ANY depth.
+///
+/// apache-arrow JS v21 throws `"Unrecognized type: undefined (24)"` on a view type
+/// wherever it appears — a `List(Utf8View)` child blanks the grid exactly like a
+/// top-level `Utf8View` column does. Assertions therefore have to walk the whole tree,
+/// not just the top level (WR-05).
+fn contains_view_type(dt: &DataType) -> bool {
+    match dt {
+        DataType::Utf8View | DataType::BinaryView => true,
+        DataType::List(f)
+        | DataType::LargeList(f)
+        | DataType::ListView(f)
+        | DataType::LargeListView(f)
+        | DataType::FixedSizeList(f, _)
+        | DataType::Map(f, _) => contains_view_type(f.data_type()),
+        DataType::Struct(fields) => fields.iter().any(|f| contains_view_type(f.data_type())),
+        DataType::Dictionary(key, value) => {
+            contains_view_type(key) || contains_view_type(value)
+        }
+        DataType::RunEndEncoded(run_ends, values) => {
+            contains_view_type(run_ends.data_type()) || contains_view_type(values.data_type())
+        }
+        _ => false,
+    }
+}
+
+/// A `Struct` column with a `Utf8View` child must come back with a `Utf8` child,
+/// values intact (WR-05).
+#[test]
+fn normalize_view_types_downcasts_struct_child_utf8view() {
+    use datafusion::arrow::array::{Array, StringArray, StringViewArray, StructArray};
+    use datafusion::arrow::datatypes::Fields;
+
+    let inner_fields: Fields = vec![
+        Field::new("name", DataType::Utf8View, true),
+        Field::new("id", DataType::Int64, false),
+    ]
+    .into();
+
+    let name_child: Arc<dyn Array> =
+        Arc::new(StringViewArray::from(vec![Some("alice"), Some("bob"), None]));
+    let id_child: Arc<dyn Array> = Arc::new(Int64Array::from(vec![1i64, 2, 3]));
+
+    let struct_arr: Arc<dyn Array> = Arc::new(StructArray::new(
+        inner_fields.clone(),
+        vec![name_child, id_child],
+        None,
+    ));
+
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "person",
+        DataType::Struct(inner_fields),
+        false,
+    )]));
+
+    let batch = RecordBatch::try_new(schema, vec![struct_arr]).unwrap();
+    let result =
+        parquet_lens_lib::engine::executor::normalize_view_types(vec![batch]).unwrap();
+
+    assert_eq!(result.len(), 1, "must return one batch");
+    let out_field_type = result[0].schema().field(0).data_type().clone();
+
+    assert!(
+        !contains_view_type(&out_field_type),
+        "a Utf8View nested inside a Struct must be normalized away; got {:?}",
+        out_field_type
+    );
+
+    // The struct's string child must round-trip as a plain Utf8 array.
+    let out_struct = result[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .expect("column 0 must still be a StructArray");
+    let name_col = out_struct
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("struct child 0 must be a StringArray after normalization");
+    assert_eq!(name_col.value(0), "alice");
+    assert_eq!(name_col.value(1), "bob");
+    assert!(name_col.is_null(2), "null must survive the nested downcast");
+}
+
+/// `List(Utf8View)` must normalize to `List(Utf8)` with offsets and values intact (WR-05).
+#[test]
+fn normalize_view_types_downcasts_list_of_utf8view() {
+    use datafusion::arrow::array::{Array, ListArray, StringArray, StringViewArray};
+    use datafusion::arrow::buffer::OffsetBuffer;
+
+    let item_field = Arc::new(Field::new("item", DataType::Utf8View, true));
+
+    let values: Arc<dyn Array> = Arc::new(StringViewArray::from(vec![
+        Some("a"),
+        Some("b"),
+        Some("c"),
+        Some("d"),
+    ]));
+    // Two lists: ["a","b"] and ["c","d"].
+    let offsets = OffsetBuffer::new(vec![0i32, 2, 4].into());
+
+    let list_arr: Arc<dyn Array> = Arc::new(ListArray::new(
+        Arc::clone(&item_field),
+        offsets,
+        values,
+        None,
+    ));
+
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "tags",
+        DataType::List(Arc::clone(&item_field)),
+        false,
+    )]));
+
+    let batch = RecordBatch::try_new(schema, vec![list_arr]).unwrap();
+    let result =
+        parquet_lens_lib::engine::executor::normalize_view_types(vec![batch]).unwrap();
+
+    let out_field_type = result[0].schema().field(0).data_type().clone();
+    assert!(
+        !contains_view_type(&out_field_type),
+        "a Utf8View nested inside a List must be normalized away; got {:?}",
+        out_field_type
+    );
+
+    let out_list = result[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .expect("column 0 must still be a ListArray");
+    assert_eq!(out_list.len(), 2, "list offsets must be preserved");
+
+    let flat = out_list
+        .values()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("list values must be a StringArray after normalization");
+    let flat_values: Vec<&str> = (0..flat.len()).map(|i| flat.value(i)).collect();
+    assert_eq!(
+        flat_values,
+        vec!["a", "b", "c", "d"],
+        "flattened list values must be unchanged"
+    );
+}
+
+/// `Dictionary(Int32, Utf8View)` must normalize its VALUE type while keeping the
+/// key type (WR-05).
+#[test]
+fn normalize_view_types_downcasts_dictionary_value_utf8view() {
+    use datafusion::arrow::array::{Array, DictionaryArray, Int32Array, StringViewArray};
+
+    let keys = Int32Array::from(vec![0i32, 1, 0]);
+    let values: Arc<dyn Array> = Arc::new(StringViewArray::from(vec![Some("x"), Some("y")]));
+    let dict: Arc<dyn Array> = Arc::new(
+        DictionaryArray::<datafusion::arrow::datatypes::Int32Type>::try_new(
+            keys,
+            Arc::clone(&values),
+        )
+        .unwrap(),
+    );
+
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "code",
+        DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8View)),
+        false,
+    )]));
+
+    let batch = RecordBatch::try_new(schema, vec![dict]).unwrap();
+    let result =
+        parquet_lens_lib::engine::executor::normalize_view_types(vec![batch]).unwrap();
+
+    let out_field_type = result[0].schema().field(0).data_type().clone();
+    assert!(
+        !contains_view_type(&out_field_type),
+        "a Utf8View dictionary VALUE type must be normalized away; got {:?}",
+        out_field_type
+    );
+    assert_eq!(
+        out_field_type,
+        DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+        "the dictionary key type must be preserved and only the value type rewritten"
+    );
+}
+
+/// IN-01: the rewrite path must not silently drop Arrow metadata. A rewrite
+/// triggered by ONE view-typed column must leave every other field's metadata and
+/// the schema-level metadata intact.
+#[test]
+fn normalize_view_types_preserves_field_and_schema_metadata() {
+    use datafusion::arrow::array::{Array, StringViewArray};
+    use std::collections::HashMap;
+
+    let mut schema_meta = HashMap::new();
+    schema_meta.insert("file".to_string(), "fixture".to_string());
+
+    let mut field_meta = HashMap::new();
+    field_meta.insert("unit".to_string(), "count".to_string());
+
+    let id_field = Field::new("id", DataType::Int64, false).with_metadata(field_meta.clone());
+    // The view-typed field is what forces the rewrite path to run at all.
+    let name_field = Field::new("name", DataType::Utf8View, true);
+
+    let schema = Arc::new(Schema::new_with_metadata(
+        vec![id_field, name_field],
+        schema_meta.clone(),
+    ));
+
+    let id_arr: Arc<dyn Array> = Arc::new(Int64Array::from(vec![1i64, 2]));
+    let name_arr: Arc<dyn Array> =
+        Arc::new(StringViewArray::from(vec![Some("alice"), Some("bob")]));
+
+    let batch = RecordBatch::try_new(schema, vec![id_arr, name_arr]).unwrap();
+    let result =
+        parquet_lens_lib::engine::executor::normalize_view_types(vec![batch]).unwrap();
+
+    let out_schema = result[0].schema();
+
+    assert_eq!(
+        out_schema.metadata(),
+        &schema_meta,
+        "schema-level metadata must survive the view-type rewrite (IN-01)"
+    );
+    assert_eq!(
+        out_schema.field(0).metadata(),
+        &field_meta,
+        "field-level metadata on an UNCHANGED column must survive a rewrite \
+         triggered by a different column (IN-01)"
+    );
+    assert_eq!(
+        out_schema.field(1).data_type(),
+        &DataType::Utf8,
+        "the view-typed column must still be normalized"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Phase 1 Plan 01 Task 1: RunQueryResponse carries the QUERY RESULT schema
 // ---------------------------------------------------------------------------
 
