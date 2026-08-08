@@ -4,7 +4,8 @@
  * Height: 160px fixed (UI-SPEC.md Screen B layout).
  * Unfocused: --border outline 1px.
  * Focused: --ring outline 2px, 2px offset (accent blue-500).
- * Ctrl+Enter (Mod-Enter) keybinding fires the `onRun` prop callback (QUERY-02).
+ * The `Mod-Enter` keybinding fires the `onRun` prop callback (QUERY-02).
+ * CodeMirror resolves `Mod` per platform: Cmd+Enter on macOS, Ctrl+Enter elsewhere.
  * Font: 13px / weight 400 (UI-SPEC.md §Typography Code role).
  *
  * Source: STACK.md §CodeMirror 6, UI-SPEC.md §SQL Editor Focus, §Accessibility Contract
@@ -21,7 +22,7 @@ interface SqlEditorProps {
   value: string;
   /** Called when the SQL text changes. */
   onChange: (sql: string) => void;
-  /** Called when the user triggers a run (Ctrl+Enter or Run button). */
+  /** Called when the user triggers a run (Mod-Enter — Cmd on macOS, Ctrl elsewhere — or the Run button). */
   onRun: () => void;
   /** Whether the editor should be read-only (e.g. while a query is running). */
   disabled?: boolean;
@@ -49,7 +50,9 @@ export function SqlEditor({ value, onChange, onRun, disabled }: SqlEditorProps) 
           sql(),
           // Editable state managed via Compartment for dynamic updates.
           editableCompartment.current.of(EditorView.editable.of(!disabled)),
-          // Ctrl+Enter / Cmd+Enter triggers the run callback (QUERY-02).
+          // Mod-Enter triggers the run callback (QUERY-02). `Mod` is resolved by
+          // CodeMirror to Cmd on macOS and Ctrl on every other platform, so this
+          // key string must stay as-is — RunBar's hint label mirrors it.
           keymap.of([
             {
               key: "Mod-Enter",
