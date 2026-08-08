@@ -9,10 +9,25 @@
  *
  * # IPC design for run_query (CONTEXT.md D-06, STACK.md §IPC Serialization Strategy)
  *
- * Row data travels as Arrow IPC binary (ArrayBuffer) via `run_query` →
- * `tauri::ipc::Response`. Metadata (total_rows, capped, and the query RESULT schema)
- * travels as JSON via `get_last_result_meta`. The two-call pattern keeps bulk row data
- * off the JSON channel.
+ * `run_query` returns ONE framed ArrayBuffer carrying both the metadata and the row
+ * bytes, built by `src-tauri/src/ipc/frame.rs::frame_meta_and_bytes`:
+ *
+ *   [0..4)             u32 little-endian meta_len
+ *   [4..4+meta_len)    meta JSON (UTF-8) — a serialized RunQueryResponse
+ *   [4+meta_len..)     Arrow IPC stream bytes (empty when the result retained 0 rows)
+ *
+ * This replaced a two-call protocol — `run_query` for the bytes, then
+ * `get_last_result_meta` for the metadata — which had a real desynchronisation window
+ * (WR-03). The engine mutex is released between two IPC commands, and:
+ *
+ *   - `open_file` is NOT gated by `isLoading` (only queries are). Dropping a file onto
+ *     the window mid-query ran `register_source`, which clears `last_query_meta`, so a
+ *     query that had already succeeded surfaced the error
+ *     "No query results cached. Call run_query first.".
+ *   - A second `run_query` replaced the cached metadata, so the grid labelled one
+ *     execution's rows with another execution's column list and row count.
+ *
+ * One response, one decode: the metadata now provably belongs to the bytes beside it.
  *
  * The result schema belongs on the metadata channel because it is sized by column
  * count, not row count — it stays far below the JSON weight budget while bulk row
@@ -37,7 +52,13 @@ export interface OpenFileResponse {
   schema: SchemaField[];
 }
 
-/** Returned by `get_last_result_meta` after SQL execution. */
+/**
+ * The shape of the JSON segment inside the `run_query` response frame.
+ *
+ * Also the return type of the retained `get_last_result_meta` command, which is now a
+ * secondary/diagnostic accessor over the backend's cached metadata rather than part of
+ * the query path (WR-03).
+ */
 export interface RunQueryResponse {
   total_rows: number;
   /** `true` when the backend 100-row cap was hit. */
@@ -117,42 +138,80 @@ export async function openRemoteFile(
 /**
  * Executes `sql` against the currently registered `data` table.
  *
- * Uses the two-command pattern (STACK.md §IPC Serialization Strategy):
- *   1. `run_query` → Arrow IPC ArrayBuffer (row data on binary channel)
- *   2. `get_last_result_meta` → JSON (total_rows, capped metadata)
- *
- * Decodes the Arrow IPC bytes with `tableFromIPC` from `apache-arrow`.
- * Converts the columnar Arrow Table into row objects for TanStack Table.
+ * Exactly ONE IPC call: the framed response carries the metadata and the row bytes
+ * together, so they always describe the same execution (WR-03 — see the file header for
+ * the two interleavings the old two-call protocol allowed).
  */
 export async function runQuery(sql: string): Promise<QueryResult> {
-  // Step 1: Get Arrow IPC bytes (binary channel).
-  const ipcBuffer = await invoke<ArrayBuffer>("run_query", { sql });
+  const frame = await invoke<ArrayBuffer>("run_query", { sql });
+  return decodeQueryFrame(frame);
+}
 
-  // Step 2: Get metadata (JSON channel — lightweight, no row data).
-  const meta = await invoke<RunQueryResponse>("get_last_result_meta");
+/**
+ * Decodes the `run_query` response frame into a renderable {@link QueryResult}.
+ *
+ * Layout, mirroring `src-tauri/src/ipc/frame.rs::frame_meta_and_bytes`:
+ *
+ *   [0..4)             u32 little-endian meta_len
+ *   [4..4+meta_len)    meta JSON (UTF-8)
+ *   [4+meta_len..)     Arrow IPC stream bytes (may be empty)
+ *
+ * Pure and synchronous — no IPC — so the whole decode path is unit-testable from a
+ * hand-built buffer.
+ *
+ * # Malformed frames fail loudly (T-02-14)
+ *
+ * Both offsets are validated before any typed-array slicing: a truncated or corrupted
+ * buffer would otherwise be read out of bounds, or JSON-parsed from an arbitrary offset,
+ * producing an unrelated error far from the cause. The thrown messages are fixed literals
+ * that interpolate no buffer content, no SQL and no file path, so a decode failure cannot
+ * leak result data into the inline error banner. `useRunQuery`'s existing catch renders
+ * the message and its `finally` clears the loading flag.
+ */
+export function decodeQueryFrame(frame: ArrayBuffer): QueryResult {
+  if (!frame || frame.byteLength < 4) {
+    throw new Error(
+      "Malformed query response: frame shorter than the 4-byte metadata length prefix"
+    );
+  }
 
-  if (!ipcBuffer || ipcBuffer.byteLength === 0) {
+  // Little-endian, matching `u32::to_le_bytes` on the backend.
+  const metaLen = new DataView(frame).getUint32(0, true);
+
+  if (4 + metaLen > frame.byteLength) {
+    throw new Error(
+      "Malformed query response: declared metadata length exceeds the response size"
+    );
+  }
+
+  const meta = JSON.parse(
+    new TextDecoder().decode(new Uint8Array(frame, 4, metaLen))
+  ) as RunQueryResponse;
+
+  const arrowBytes = new Uint8Array(frame, 4 + metaLen);
+
+  if (arrowBytes.byteLength === 0) {
+    // A zero-row result serializes to zero Arrow bytes, but its metadata is real: the
+    // backend captures the result schema from the executed stream, not from the retained
+    // batches. `total_rows` and `capped` come from `meta` too — this branch used to
+    // fabricate `0` and `false`, which would have misreported any future change to the
+    // backend's semantics (IN-03).
     return {
       table: tableFromIPC(new Uint8Array(0)),
       rows: [],
-      total_rows: 0,
-      capped: false,
-      // A zero-row result still knows its columns — the backend takes the schema
-      // from the executed stream, not from the retained batches.
+      total_rows: meta.total_rows,
+      capped: meta.capped,
       schema: meta.schema,
     };
   }
 
-  // Decode Arrow IPC bytes into a columnar Table.
-  const table = tableFromIPC(ipcBuffer);
-
-  // Convert the columnar Arrow Table to row objects for TanStack Table consumption.
-  // Each row is `Record<string, unknown>` with column names as keys.
-  const rows = arrowTableToRows(table);
+  // Decode Arrow IPC bytes into a columnar Table, then into row objects for TanStack
+  // Table consumption. Each row is `Record<string, unknown>` keyed by deduped column key.
+  const table = tableFromIPC(arrowBytes);
 
   return {
     table,
-    rows,
+    rows: arrowTableToRows(table),
     total_rows: meta.total_rows,
     capped: meta.capped,
     schema: meta.schema,
