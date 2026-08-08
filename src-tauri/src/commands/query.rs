@@ -2,13 +2,27 @@
 //!
 //! # IPC design (CONTEXT.md D-06, STACK.md §IPC Serialization Strategy)
 //!
-//! `run_query` uses a two-command pattern to keep row data on the binary channel
-//! and metadata on the JSON channel (CONTEXT.md: "JSON only for sub-10KB metadata"):
+//! `run_query(sql)` returns a SINGLE framed `tauri::ipc::Response` carrying both the
+//! result metadata and the row bytes:
 //!
-//!   1. `run_query(sql)` → `tauri::ipc::Response` (Arrow IPC bytes as ArrayBuffer).
-//!      The frontend uses `tableFromIPC(arrayBuffer)` to decode rows.
-//!   2. `get_last_result_meta()` → `RunQueryResponse` (JSON: total_rows, capped).
-//!      Called immediately after `run_query` to get the 100-row-cap metadata.
+//! ```text
+//! [0..4)              u32 little-endian meta_len
+//! [4..4+meta_len)     meta JSON (UTF-8) — a serialized `RunQueryResponse`
+//! [4+meta_len..)      Arrow IPC stream bytes (empty for a zero-row result)
+//! ```
+//!
+//! The frame is built by `crate::ipc::frame::frame_meta_and_bytes` and decoded by
+//! `decodeQueryFrame` in `src/lib/tauri.ts`. Bulk row data still travels as binary and
+//! the metadata segment stays sized by column count, so the original channel-separation
+//! intent (CONTEXT.md: "JSON only for sub-10KB metadata") is preserved.
+//!
+//! This replaces an earlier two-command pattern — `run_query` for bytes, then
+//! `get_last_result_meta` for metadata. The engine mutex was released between those two
+//! calls, so an interleaved `open_file` (which clears `last_query_meta` via
+//! `register_source`) turned a successful query into "No query results cached", and an
+//! interleaved `run_query` paired one execution's bytes with another's metadata. Framing
+//! removes that desynchronisation window: both halves come from the same
+//! `engine.execute` return value (WR-03).
 //!
 //! `get_page(offset, size)` → `PageResponse` (JSON row slice from the cached result).
 //!
@@ -161,13 +175,20 @@ fn set_expr_is_read_only(expr: &datafusion::sql::sqlparser::ast::SetExpr) -> boo
     }
 }
 
-/// Executes `sql` against the registered `data` table and returns Arrow IPC bytes.
+/// Executes `sql` against the registered `data` table and returns one framed response
+/// carrying BOTH the result metadata and the Arrow IPC row bytes.
 ///
 /// The 100-row stream-stop cap is enforced by `QueryEngine::execute` (GRID-03).
-/// Row data is returned as an Arrow IPC binary stream via `tauri::ipc::Response`
-/// so the frontend can decode with `tableFromIPC(arrayBuffer)` (STACK.md §IPC Serialization Strategy).
+/// The frame layout is documented on this module and on
+/// `crate::ipc::frame::frame_meta_and_bytes`; the frontend decodes it with
+/// `decodeQueryFrame` (STACK.md §IPC Serialization Strategy).
 ///
-/// Call `get_last_result_meta()` immediately after to retrieve `total_rows` and `capped`.
+/// # Atomicity (WR-03)
+///
+/// The metadata and the bytes are the two halves of a single `engine.execute` return
+/// value and are serialized together, so they can never describe different executions.
+/// A second round-trip for the metadata could be — and was — desynchronised by any
+/// command that ran while the engine mutex was free.
 ///
 /// # Security (D-07 / D-08)
 ///
@@ -182,20 +203,36 @@ pub async fn run_query(
     // AST-based check via DFParser — not a string prefix. Cannot be bypassed via IPC.
     guard_select_only(&sql)?;
 
-    let mut engine = state.engine.lock().await;
-    let (_meta, ipc_bytes) = engine.execute(&sql).await?;
-    // Metadata is cached on engine.last_query_meta; retrievable via get_last_result_meta.
+    let (meta, ipc_bytes) = {
+        let mut engine = state.engine.lock().await;
+        engine.execute(&sql).await?
+        // The metadata is also cached on engine.last_query_meta for the secondary
+        // get_last_result_meta accessor, but this path no longer depends on that cache.
+    };
+    // Lock released: framing touches nothing shared, and `meta` is already paired with
+    // `ipc_bytes` by value, so nothing that happens next can desynchronise them.
 
-    Ok(tauri::ipc::Response::new(ipc_bytes))
+    let frame = crate::ipc::frame::frame_meta_and_bytes(&meta, &ipc_bytes)?;
+
+    Ok(tauri::ipc::Response::new(frame))
 }
 
 /// Returns the metadata from the most recent `run_query` call
 /// (`total_rows`, `capped`, and the query RESULT schema).
 ///
-/// Must be called after `run_query`. Returns an error if no query has been executed.
-/// This command exists so row data (binary IPC) and metadata (JSON) travel on separate channels
-/// (CONTEXT.md: JSON only for sub-10KB metadata, binary IPC for row data). The result schema
-/// belongs on this channel because it is metadata sized by column count (D-PH1-01).
+/// # Retained as a secondary accessor only (WR-03)
+///
+/// This command is NO LONGER part of the `run_query` path: `run_query` now returns the
+/// same metadata inline in its framed response, so the frontend never makes this call
+/// during a query. It remains registered as a diagnostic read of the cached
+/// `last_query_meta` — and as such it is inherently a snapshot of whatever query ran
+/// last, which is exactly why the query path stopped relying on it.
+///
+/// Returns an error if no query has been executed since the last file open
+/// (`register_source` clears the cache).
+///
+/// The result schema belongs on the metadata channel because it is sized by column
+/// count, not row count (D-PH1-01).
 ///
 /// The cached struct is cloned wholesale rather than rebuilt field-by-field: a manual rebuild
 /// silently drops any newly added field (it dropped `schema` before this change) and is a

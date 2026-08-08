@@ -13,6 +13,7 @@
 //! `format!("{:?}", data_type)` expression, so the sidebar and the grid can never
 //! disagree about how a type is spelled (D-PH1-01).
 
+pub mod frame;
 pub mod serializer;
 
 use serde::{Deserialize, Serialize};
