@@ -162,8 +162,9 @@ export async function runQuery(sql: string): Promise<QueryResult> {
 /**
  * Makes a positional list of column names unique, preserving order and length.
  *
- * The nth occurrence (n ≥ 2) of a name becomes `${name}__${n}`; the first
- * occurrence keeps the bare name.
+ * The nth occurrence (n ≥ 2) of a name becomes `${name}__${n}` UNLESS that key
+ * is already taken, in which case the suffix advances until an unused key is
+ * found; the first occurrence keeps the bare name.
  *
  * # Why this exists (D-PH1-03)
  *
@@ -173,16 +174,36 @@ export async function runQuery(sql: string): Promise<QueryResult> {
  * grid would render duplicate TanStack column ids. Deduping positionally keeps
  * each column independent, with its own values.
  *
+ * # Why the probe-forward loop (WR-01)
+ *
+ * The suffix pattern is not a reserved namespace: SQL can legitimately produce
+ * a result column literally named `price__2` (`select price, x as price__2,
+ * price from data`), and a source Parquet file can contain one. Counting
+ * occurrences per name alone would then emit `price__2` twice — and two
+ * identical keys are a data-integrity failure, not a cosmetic one:
+ * `arrowTableToRows` would overwrite one column's values with the other's, and
+ * TanStack would receive two ColumnDefs sharing one id. Checking each candidate
+ * key against every key already emitted (`used`) makes uniqueness structural.
+ *
  * The ORIGINAL name is still what the user sees: the grid header renders
  * `SchemaField.name`, while the deduped key is only ever a lookup key.
  */
 export function dedupeFieldKeys(names: string[]): string[] {
+  // Occurrence counter per source name, and every key already handed out.
   const seen = new Map<string, number>();
+  const used = new Set<string>();
 
   return names.map((name) => {
-    const count = (seen.get(name) ?? 0) + 1;
+    let count = (seen.get(name) ?? 0) + 1;
+    let key = count === 1 ? name : `${name}__${count}`;
+    // Probe forward: a source column may literally be named `${name}__${count}`.
+    while (used.has(key)) {
+      count += 1;
+      key = `${name}__${count}`;
+    }
     seen.set(name, count);
-    return count === 1 ? name : `${name}__${count}`;
+    used.add(key);
+    return key;
   });
 }
 
@@ -200,8 +221,21 @@ const COUNT_STAR_OUTPUT_NAME = "count(*)";
  * so the user reads a plain `count : <value>` presentation. Every other name —
  * including other aggregates (`sum(price)`, `avg(price)`), computed columns and
  * explicit SQL aliases — passes through verbatim, with its original whitespace
- * and casing intact. An alias always wins: `select count(*) as n` makes
- * DataFusion name the column `n`, which no longer matches and is never rewritten.
+ * and casing intact. An alias wins unless the alias is itself literally
+ * `count(*)`: `select count(*) as n` makes DataFusion name the column `n`,
+ * which no longer matches and is never rewritten.
+ *
+ * # Known limitation (IN-02)
+ *
+ * A source Parquet column, or an explicit alias, literally named `count(*)` —
+ * in any casing, with any surrounding whitespace — is ALSO displayed as `count`,
+ * because the match is on the name string and the backend does not flag
+ * count-star columns in `SchemaField`. So `select sum(x) as "count(*)"` reads
+ * `count` in the header and tooltip even though it is a sum. This is an accepted
+ * cosmetic tradeoff for a pathological input: it affects presentation only
+ * (ids, accessors and row keys are unaffected), and the value shown is still the
+ * column's real value. The stronger fix would be a backend-supplied flag on
+ * `SchemaField` marking the count-star output column, replacing this name match.
  *
  * # PRESENTATION ONLY — never use this as a key
  *
