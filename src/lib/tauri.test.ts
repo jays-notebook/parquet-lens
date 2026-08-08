@@ -109,8 +109,24 @@ describe("dedupeFieldKeys", () => {
     expect(dedupeFieldKeys([])).toEqual([]);
   });
 
+  it("probes past an existing __N name", () => {
+    // `select price, x as price__2, price from data` — the generated key for the
+    // third column would collide with the literal second column name (WR-01).
+    expect(dedupeFieldKeys(["price", "price__2", "price"])).toEqual([
+      "price",
+      "price__2",
+      "price__3",
+    ]);
+  });
+
+  it("pushes a literal __N source name forward", () => {
+    // The generated `a__2` claims the key first, so the literal source name
+    // `a__2` must advance rather than collide (WR-01).
+    expect(dedupeFieldKeys(["a", "a", "a__2"])).toEqual(["a", "a__2", "a__2__2"]);
+  });
+
   it("always preserves length and produces unique keys", () => {
-    const input = ["x", "x", "y", "x", "y", "z"];
+    const input = ["x", "x", "x__2", "x", "x__2", "y"];
     const out = dedupeFieldKeys(input);
 
     expect(out).toHaveLength(input.length);
