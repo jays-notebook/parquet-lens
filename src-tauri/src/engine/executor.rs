@@ -18,6 +18,7 @@ use std::sync::Arc;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::compute::{can_cast_types, cast, concat_batches};
 use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
+use datafusion::execution::context::SQLOptions;
 use futures::StreamExt;
 
 use crate::engine::QueryEngine;
@@ -35,7 +36,9 @@ impl QueryEngine {
     ///
     /// # Behavior
     ///
-    /// 1. Builds a `DataFrame` via `SessionContext::sql`.
+    /// 1. Builds a `DataFrame` via `SessionContext::sql_with_options` with DDL, DML and
+    ///    statements all disallowed — the plan-level backstop behind the AST guard in
+    ///    `commands/query.rs` (WR-04).
     /// 2. Streams batches via `execute_stream()` — never `collect()` (PITFALLS.md §Pitfall 1).
     /// 3. Captures the RESULT schema from the stream, before draining it, so the frontend
     ///    can build grid columns from the result rather than the opened file (D-PH1-01).
@@ -59,9 +62,21 @@ impl QueryEngine {
         self.result_batch_cache = None;
         self.last_query_meta = None;
 
+        // Defence in depth for WR-04. `sql_with_options` runs `verify_plan` over the
+        // built `LogicalPlan` and rejects `Ddl`, `Dml`, `Copy` and `Statement` nodes, so a
+        // write-shaped plan — `CreateMemoryTable` from `SELECT ... INTO`, or any future
+        // write-shaped construct — is refused at PLAN level even if the AST guard in
+        // `commands/query.rs` is ever bypassed, including on a direct IPC call that reaches
+        // the engine another way. All three flags default to `true`, so each one must be
+        // set explicitly; omitting any of them silently restores the hole.
+        let opts = SQLOptions::new()
+            .with_allow_ddl(false)
+            .with_allow_dml(false)
+            .with_allow_statements(false);
+
         let df = self
             .ctx()
-            .sql(sql)
+            .sql_with_options(sql, opts)
             .await
             .map_err(|e| format!("SQL planning error: {}", e))?;
 
