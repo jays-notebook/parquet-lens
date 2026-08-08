@@ -1051,6 +1051,112 @@ async fn test_execute_result_schema_present_for_empty_result() {
 }
 
 // ---------------------------------------------------------------------------
+// WR-04 layer 2: plan-level backstop (SQLOptions) inside the executor
+//
+// These tests call `execute` DIRECTLY, deliberately bypassing `guard_select_only`.
+// That is the whole point: layer 1 lives in commands/query.rs, and this layer must
+// hold on its own for anything that reaches the engine another way.
+// ---------------------------------------------------------------------------
+
+/// `SELECT ... INTO` must be refused at PLAN level and must leave no session table
+/// behind (WR-04).
+///
+/// The second assertion is the decisive one: DataFusion plans `SELECT ... INTO` as
+/// `CreateMemoryTable`, so without the `SQLOptions` backstop the statement executes
+/// and a subsequent `select * from t` SUCCEEDS against the table it created.
+#[tokio::test]
+async fn test_execute_rejects_select_into_at_plan_level() {
+    let fixture_path = small_fixture_path();
+    let source = LocalFileSource::new(fixture_path).expect("small fixture must exist");
+
+    let mut engine = QueryEngine::new();
+    engine
+        .register_source(&source)
+        .await
+        .expect("register_source must succeed");
+
+    let result = engine.execute("select * into t from data").await;
+
+    assert!(
+        result.is_err(),
+        "SELECT ... INTO plans as CreateMemoryTable and must be rejected at plan level (WR-04)"
+    );
+    let msg = result.err().unwrap_or_default();
+    assert!(
+        msg.contains("SQL planning error"),
+        "the rejection must surface through the existing planning-error wrapper so the \
+         frontend error surface is unchanged; got '{msg}'"
+    );
+
+    // Decisive: no session table may have been created by the rejected statement.
+    let follow_up = engine.execute("select * from t").await;
+    assert!(
+        follow_up.is_err(),
+        "the rejected SELECT ... INTO must NOT have created a session table `t` — \
+         a successful `select * from t` proves the DDL side effect happened (WR-04)"
+    );
+}
+
+/// The `SQLOptions` backstop must not narrow what ordinary read-only SQL can do:
+/// aggregates still plan, execute and report their own result schema.
+#[tokio::test]
+async fn test_execute_select_still_works_with_sql_options() {
+    let fixture_path = small_fixture_path();
+    let source = LocalFileSource::new(fixture_path).expect("small fixture must exist");
+
+    let mut engine = QueryEngine::new();
+    engine
+        .register_source(&source)
+        .await
+        .expect("register_source must succeed");
+
+    let (meta, _ipc_bytes) = engine
+        .execute("select count(*) from data")
+        .await
+        .expect("an aggregate SELECT must still execute under sql_with_options");
+
+    assert_eq!(
+        meta.total_rows, 1,
+        "count(*) must return exactly one row, got {}",
+        meta.total_rows
+    );
+    assert_eq!(
+        meta.schema.len(),
+        1,
+        "count(*) must report exactly one result-schema field, got {}",
+        meta.schema.len()
+    );
+    assert_eq!(
+        meta.schema[0].arrow_type, "Int64",
+        "the count(*) result column must still be labelled Int64 under sql_with_options"
+    );
+}
+
+/// A CTE is a read-only construct and must survive the backstop unchanged.
+#[tokio::test]
+async fn test_execute_cte_still_works_with_sql_options() {
+    let fixture_path = small_fixture_path();
+    let source = LocalFileSource::new(fixture_path).expect("small fixture must exist");
+
+    let mut engine = QueryEngine::new();
+    engine
+        .register_source(&source)
+        .await
+        .expect("register_source must succeed");
+
+    let (meta, _ipc_bytes) = engine
+        .execute("with c as (select * from data) select count(*) from c")
+        .await
+        .expect("a read-only CTE must still execute under sql_with_options");
+
+    assert_eq!(
+        meta.total_rows, 1,
+        "the CTE aggregate must return exactly one row, got {}",
+        meta.total_rows
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Bonus: get_page returns correct slice from cached result
 // ---------------------------------------------------------------------------
 
