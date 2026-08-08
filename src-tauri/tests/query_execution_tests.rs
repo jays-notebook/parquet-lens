@@ -1157,6 +1157,94 @@ async fn test_execute_cte_still_works_with_sql_options() {
 }
 
 // ---------------------------------------------------------------------------
+// WR-02 (phase 02 review): a stream error during the CAP PEEK must not fail an
+// already-complete 100-row result.
+// ---------------------------------------------------------------------------
+
+/// A `PartitionStream` that yields one exactly-at-the-cap batch and then a stream
+/// error — the precise shape where the executor's peek loop observes an error in
+/// a batch it would have DROPPED anyway.
+#[derive(Debug)]
+struct ErrAfterCapStream {
+    schema: datafusion::arrow::datatypes::SchemaRef,
+}
+
+impl datafusion::physical_plan::streaming::PartitionStream for ErrAfterCapStream {
+    fn schema(&self) -> &datafusion::arrow::datatypes::SchemaRef {
+        &self.schema
+    }
+
+    fn execute(
+        &self,
+        _ctx: Arc<datafusion::execution::TaskContext>,
+    ) -> datafusion::execution::SendableRecordBatchStream {
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+
+        let ids: Arc<dyn Array> = Arc::new(Int64Array::from((1..=100i64).collect::<Vec<_>>()));
+        let batch = RecordBatch::try_new(Arc::clone(&self.schema), vec![ids])
+            .expect("cap-sized batch must build");
+
+        let items = vec![
+            Ok(batch),
+            Err(datafusion::error::DataFusionError::Execution(
+                "simulated corruption past the cap".to_string(),
+            )),
+        ];
+        Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&self.schema),
+            futures::stream::iter(items),
+        ))
+    }
+}
+
+/// The slice branch never observes errors past the cap (it breaks immediately),
+/// so the peek branch must not fail on them either — the same data with the same
+/// corruption past row 100 must not succeed or fail depending only on how the
+/// source chunked its batches. The peek error is treated as end-of-stream and
+/// `capped` is reported `true` conservatively (WR-02).
+#[tokio::test]
+async fn test_execute_peek_error_past_cap_does_not_fail_result() {
+    use datafusion::catalog::streaming::StreamingTable;
+
+    let schema: datafusion::arrow::datatypes::SchemaRef =
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+
+    let table = StreamingTable::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(ErrAfterCapStream {
+            schema: Arc::clone(&schema),
+        })],
+    )
+    .expect("StreamingTable::try_new must succeed");
+
+    let mut engine = QueryEngine::new();
+    engine
+        .ctx()
+        .register_table("err_data", Arc::new(table))
+        .expect("register_table must succeed");
+
+    let (meta, ipc_bytes) = engine.execute("select * from err_data").await.expect(
+        "an error in a batch past the cap must not discard the 100 already-retained \
+         rows (WR-02)",
+    );
+
+    assert_eq!(
+        meta.total_rows, 100,
+        "all 100 retained rows must survive the peek error, got {}",
+        meta.total_rows
+    );
+    assert!(
+        meta.capped,
+        "capped must be reported true conservatively when the peek hits an error — \
+         completeness cannot be proven (WR-02)"
+    );
+    assert!(
+        !ipc_bytes.is_empty(),
+        "IPC bytes must be non-empty for the retained 100-row result"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Bonus: get_page returns correct slice from cached result
 // ---------------------------------------------------------------------------
 

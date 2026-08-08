@@ -152,7 +152,20 @@ impl QueryEngine {
                 // ROW_CAP and the full result is still never accumulated.
                 let mut more = false;
                 while let Some(peeked_result) = stream.next().await {
-                    let peeked = peeked_result.map_err(|e| format!("Stream error: {}", e))?;
+                    let peeked = match peeked_result {
+                        Ok(batch) => batch,
+                        Err(_) => {
+                            // WR-02 (phase 02 review): rows past the cap would have been
+                            // DROPPED regardless, so an error reading them cannot invalidate
+                            // the 100 rows already retained — the slice branch above never
+                            // even observes errors past the cap, and the two paths must not
+                            // succeed or fail differently depending only on how the source
+                            // chunked its batches. Report capped=true conservatively: we
+                            // cannot prove the result was complete.
+                            more = true;
+                            break;
+                        }
+                    };
                     if peeked.num_rows() > 0 {
                         more = true;
                         break;
