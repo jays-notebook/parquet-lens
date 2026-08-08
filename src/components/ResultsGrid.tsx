@@ -24,9 +24,17 @@
  * unified: row objects are keyed by the raw backend names, so a display name in an
  * id or accessor would resolve to `undefined` and render every cell as NULL.
  *
+ * Phase 2 (Plan 02-01): the table is gated on the RESULT COLUMN COUNT via
+ * `resultsViewState`, not on the row count, so a query returning zero rows still
+ * renders its headers plus a `Query returned 0 rows.` notice instead of falling
+ * back to the pre-query welcome card (WR-02). Column definitions and their
+ * deduped keys are memoized on `resultSchema`, so `useReactTable` receives a
+ * stable `columns` reference across renders (IN-04).
+ *
  * Source: STACK.md §TanStack Table + Virtual, UI-SPEC.md §Results Grid
  */
 
+import { useMemo } from "react";
 import {
   flexRender,
   getCoreRowModel,
@@ -34,6 +42,7 @@ import {
   type ColumnDef,
 } from "@tanstack/react-table";
 import { dedupeFieldKeys, displayColumnName, type SchemaField } from "@/lib/tauri";
+import { resultsViewState } from "@/lib/gridView";
 import { useShallow } from "zustand/react/shallow";
 import { useAppStore } from "@/store/appStore";
 import { LoadingOverlay } from "@/components/LoadingOverlay";
@@ -47,9 +56,13 @@ export function ResultsGrid() {
 
   // Same positional field-name list `arrowTableToRows` keyed the rows with, so
   // column ids and row keys are guaranteed to agree (D-PH1-03).
-  const columnKeys = dedupeFieldKeys(resultSchema.map((f) => f.name));
+  const columnKeys = useMemo(
+    () => dedupeFieldKeys(resultSchema.map((f) => f.name)),
+    [resultSchema]
+  );
 
-  const columns: ColumnDef<Record<string, unknown>, unknown>[] = resultSchema.map((field, i) => ({
+  const columns: ColumnDef<Record<string, unknown>, unknown>[] = useMemo(
+    () => resultSchema.map((field, i) => ({
     id: columnKeys[i],
     // accessorFn, NOT accessorKey: TanStack treats accessorKey as a dot-delimited
     // deep path, so a result column named e.g. `sum(a.b)` — which DataFusion will
@@ -83,7 +96,9 @@ export function ResultsGrid() {
       }
       return String(value);
     },
-  }));
+    })),
+    [resultSchema, columnKeys]
+  );
 
   const table = useReactTable({
     data: rows,
@@ -91,7 +106,7 @@ export function ResultsGrid() {
     getCoreRowModel: getCoreRowModel(),
   });
 
-  const hasResults = rows.length > 0;
+  const view = resultsViewState(rows.length, resultSchema.length, isLoading);
 
   return (
     <div
@@ -109,7 +124,7 @@ export function ResultsGrid() {
       <LoadingOverlay visible={isLoading} />
 
       <div style={{ opacity: isLoading ? 0.3 : 1, minHeight: "100%" }}>
-        {!hasResults && !isLoading && (
+        {view.showEmptyState && (
           <div
             style={{
               display: "flex",
@@ -138,7 +153,7 @@ export function ResultsGrid() {
           </div>
         )}
 
-        {hasResults && (
+        {view.showTable && (
           <table
             style={{
               borderCollapse: "collapse",
@@ -221,6 +236,18 @@ export function ResultsGrid() {
               ))}
             </tbody>
           </table>
+        )}
+
+        {view.showZeroRowNotice && (
+          <div
+            style={{
+              padding: "12px 8px",
+              fontSize: "14px",
+              color: "var(--muted-foreground)",
+            }}
+          >
+            <p style={{ margin: 0 }}>Query returned 0 rows.</p>
+          </div>
         )}
       </div>
     </div>
