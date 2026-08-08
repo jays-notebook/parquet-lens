@@ -126,6 +126,47 @@ fn test_reject_select_into_in_set_operation() {
 }
 
 #[test]
+fn test_reject_select_into_in_derived_table() {
+    // WR-01 (phase 02 review): the INTO hides in a FROM-clause derived table, which
+    // walking the outer `SetExpr` tree alone never reaches. Layer 1 must reject it
+    // itself — with its explicit read-only message, not the generic planning error.
+    let result = guard_select_only("select * from (select * into t from data) sub");
+    assert!(
+        result.is_err(),
+        "SELECT ... INTO inside a FROM-clause derived table must be rejected at \
+         layer 1 (WR-01)"
+    );
+    let msg = result.unwrap_err();
+    assert!(
+        msg.contains("read-only"),
+        "the rejection must carry the guard's explicit read-only message, proving \
+         layer 1 (not the plan-level backstop) caught it; got '{msg}'"
+    );
+}
+
+#[test]
+fn test_reject_select_into_in_joined_derived_table() {
+    // WR-01: the INTO hides in a JOINed relation, not the base relation, so the walk
+    // must cover every join operand too.
+    let result = guard_select_only(
+        "select * from data d join (select * into t from data) x on d.id = x.id",
+    );
+    assert!(
+        result.is_err(),
+        "SELECT ... INTO inside a JOINed derived table must be rejected at layer 1 (WR-01)"
+    );
+}
+
+#[test]
+fn test_allow_plain_derived_table() {
+    // The WR-01 FROM-clause walk must not break legitimate derived tables.
+    assert!(
+        guard_select_only("select * from (select * from data) sub").is_ok(),
+        "a read-only derived table must still be allowed after the WR-01 walk"
+    );
+}
+
+#[test]
 fn test_reject_select_into_in_cte() {
     // The INTO hides in a CTE body, which the outer query's `body` never reaches.
     let result = guard_select_only("with c as (select * into t from data) select * from c");

@@ -56,10 +56,17 @@ use crate::state::AppState;
 /// every file open), but the documented guarantee was false. Source: review finding
 /// WR-04.
 ///
-/// The guard now validates the query RECURSIVELY: the query body and every CTE body
-/// are walked, `into: Some(..)` is rejected wherever it appears (including inside a
-/// set operation operand or a CTE), and every `SetExpr` variant is handled explicitly
-/// so a future grammar addition cannot silently reopen the hole.
+/// The guard now validates the query RECURSIVELY: the query body, every CTE body,
+/// every set-operation operand, and every FROM-clause relation (derived-table
+/// subqueries, nested joins, and the inputs of PIVOT/UNPIVOT/MATCH_RECOGNIZE) are
+/// walked, and `into: Some(..)` is rejected wherever that walk reaches. Every
+/// `SetExpr` and `TableFactor` variant is handled explicitly so a future grammar
+/// addition cannot silently reopen the hole.
+///
+/// Known limit of layer 1 (review finding WR-01): expression-level subqueries
+/// (`Expr::Subquery` in the projection or `WHERE`) are NOT walked here. An `INTO`
+/// hidden there is stopped by the plan-level `SQLOptions` backstop in
+/// `engine/executor.rs`, which visits the whole plan tree including subqueries.
 ///
 /// # Note on sqlparser access
 ///
@@ -154,8 +161,13 @@ fn set_expr_is_read_only(expr: &datafusion::sql::sqlparser::ast::SetExpr) -> boo
     use datafusion::sql::sqlparser::ast::SetExpr;
 
     match expr {
-        // The `INTO` that DataFusion plans as `CreateMemoryTable` lives here.
-        SetExpr::Select(select) => select.into.is_none(),
+        // The `INTO` that DataFusion plans as `CreateMemoryTable` lives here — and it
+        // can also hide inside a FROM-clause relation, e.g. a derived table:
+        // `select * from (select * into t from data) sub` (review finding WR-01).
+        SetExpr::Select(select) => {
+            select.into.is_none()
+                && select.from.iter().all(table_with_joins_is_read_only)
+        }
 
         // A parenthesised subquery may carry its own WITH clause and body.
         SetExpr::Query(inner) => query_is_read_only(inner),
@@ -172,6 +184,57 @@ fn set_expr_is_read_only(expr: &datafusion::sql::sqlparser::ast::SetExpr) -> boo
         // reachable through the current DataFusion grammar, but they exist so a grammar
         // change cannot reopen the hole silently.
         SetExpr::Insert(_) | SetExpr::Update(_) | SetExpr::Delete(_) | SetExpr::Merge(_) => false,
+    }
+}
+
+/// Returns `true` when a FROM-clause entry — its base relation AND every joined
+/// relation — performs no write-shaped operation (review finding WR-01).
+fn table_with_joins_is_read_only(twj: &datafusion::sql::sqlparser::ast::TableWithJoins) -> bool {
+    table_factor_is_read_only(&twj.relation)
+        && twj.joins.iter().all(|j| table_factor_is_read_only(&j.relation))
+}
+
+/// Returns `true` when a single FROM-clause relation performs no write-shaped
+/// operation at any depth.
+///
+/// A derived table carries a full `Query` — `select * from (select * into t from
+/// data) sub` hides its `INTO` there — so this walk is what makes the layer-1
+/// guarantee ("rejected wherever the walk reaches") true for FROM clauses (WR-01).
+///
+/// Every `TableFactor` variant is matched explicitly — no catch-all — for the same
+/// reason as `set_expr_is_read_only`: a new variant added by a future sqlparser
+/// release must break the build rather than default to "allowed".
+fn table_factor_is_read_only(tf: &datafusion::sql::sqlparser::ast::TableFactor) -> bool {
+    use datafusion::sql::sqlparser::ast::TableFactor;
+
+    match tf {
+        // A derived table is a parenthesised subquery — recurse into the full Query
+        // (body + its own CTEs) exactly like a top-level query (WR-01).
+        TableFactor::Derived { subquery, .. } => query_is_read_only(subquery),
+
+        // A parenthesised join tree nests a whole FROM entry: recurse into the base
+        // relation and every join operand.
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => table_with_joins_is_read_only(table_with_joins),
+
+        // Operators that wrap another table factor: unwrap and recurse into the input.
+        TableFactor::Pivot { table, .. }
+        | TableFactor::Unpivot { table, .. }
+        | TableFactor::MatchRecognize { table, .. } => table_factor_is_read_only(table),
+
+        // Leaf relations: plain table references and table-valued functions. These
+        // carry identifiers/expressions, not query bodies, so there is no `Query` to
+        // recurse into here. (Scalar subqueries inside their argument EXPRESSIONS are
+        // the documented layer-1 limit — covered by the SQLOptions plan backstop.)
+        TableFactor::Table { .. }
+        | TableFactor::TableFunction { .. }
+        | TableFactor::Function { .. }
+        | TableFactor::UNNEST { .. }
+        | TableFactor::JsonTable { .. }
+        | TableFactor::OpenJsonTable { .. }
+        | TableFactor::XmlTable { .. }
+        | TableFactor::SemanticView { .. } => true,
     }
 }
 
