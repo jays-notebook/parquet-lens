@@ -29,6 +29,8 @@ use parquet_lens_lib::storage::LocalFileSource;
 const LARGE_FIXTURE_PATH: &str = "tests/fixtures/large_sample.parquet";
 /// Path to the small test fixture (<100 rows).
 const SMALL_FIXTURE_PATH: &str = "tests/fixtures/sample.parquet";
+/// Path to the exactly-at-the-cap fixture (exactly ROW_CAP == 100 rows).
+const EXACT_100_FIXTURE_PATH: &str = "tests/fixtures/exact_100.parquet";
 
 /// Creates a large Parquet fixture with 150 rows (3 columns: id Int64, label Utf8, score Float64).
 fn ensure_large_fixture() -> PathBuf {
@@ -85,6 +87,63 @@ fn create_large_fixture(path: &PathBuf) {
         vec![id_arr, label_arr, score_arr],
     )
     .unwrap();
+
+    let file = File::create(path).unwrap();
+    let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+}
+
+/// Creates a Parquet fixture holding EXACTLY 100 rows — the same count as the
+/// executor's `ROW_CAP`. Used to prove that a *complete* result which happens to
+/// land exactly on the cap is not reported as truncated (WR-06).
+///
+/// Same three columns as the large fixture (id Int64 non-null, label Utf8
+/// nullable, score Float64 nullable) so the two are interchangeable in queries.
+fn ensure_exact_100_fixture() -> PathBuf {
+    let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(EXACT_100_FIXTURE_PATH);
+
+    if !fixture_path.exists() {
+        create_exact_100_fixture(&fixture_path);
+    }
+
+    fixture_path
+}
+
+/// Writes a 100-row Parquet fixture for cap-accuracy tests.
+fn create_exact_100_fixture(path: &PathBuf) {
+    use datafusion::parquet::arrow::ArrowWriter;
+    use std::fs::File;
+
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("label", DataType::Utf8, true),
+        Field::new("score", DataType::Float64, true),
+    ]));
+
+    const ROW_COUNT: usize = 100;
+
+    let ids: Vec<i64> = (1..=ROW_COUNT as i64).collect();
+    let labels: Vec<Option<&str>> = (0..ROW_COUNT)
+        .map(|i| if i % 20 == 0 { None } else { Some("row") })
+        .collect();
+    let scores: Vec<Option<f64>> = (0..ROW_COUNT)
+        .map(|i| {
+            if i % 15 == 0 {
+                None
+            } else {
+                Some(i as f64 * 1.5)
+            }
+        })
+        .collect();
+
+    let id_arr = Arc::new(Int64Array::from(ids));
+    let label_arr = Arc::new(StringArray::from(labels));
+    let score_arr = Arc::new(Float64Array::from(scores));
+
+    let batch = RecordBatch::try_new(schema.clone(), vec![id_arr, label_arr, score_arr]).unwrap();
 
     let file = File::create(path).unwrap();
     let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
@@ -235,6 +294,73 @@ async fn test_execute_limit_1000_still_caps_at_100() {
     assert!(
         meta.capped,
         "capped must be true when backend cap is hit regardless of query LIMIT"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// WR-06: `capped` means TRUNCATED, not "reached the cap"
+// ---------------------------------------------------------------------------
+
+/// A file whose entire content is exactly `ROW_CAP` rows produces a COMPLETE
+/// result — nothing was discarded, so `capped` must be false even though
+/// `total_rows` equals the cap (WR-06).
+#[tokio::test]
+async fn test_execute_exactly_100_rows_is_not_capped() {
+    let fixture_path = ensure_exact_100_fixture();
+    let source = LocalFileSource::new(fixture_path).expect("exact-100 fixture must exist");
+
+    let mut engine = QueryEngine::new();
+    engine
+        .register_source(&source)
+        .await
+        .expect("register_source must succeed");
+
+    let (meta, _ipc_bytes) = engine
+        .execute("select * from data")
+        .await
+        .expect("execute must succeed");
+
+    assert_eq!(
+        meta.total_rows, 100,
+        "the exact-100 fixture must return all 100 of its rows, got {}",
+        meta.total_rows
+    );
+    assert!(
+        !meta.capped,
+        "a COMPLETE result that lands exactly on the 100-row cap was not truncated — \
+         `capped` must stay false; it reports truncation, not cap-reached (WR-06)"
+    );
+}
+
+/// `limit 100` on a 150-row file is the app's own default query. The result is
+/// complete with respect to the query, so nothing was truncated by the backend
+/// cap and `capped` must be false (WR-06).
+#[tokio::test]
+async fn test_execute_limit_100_on_larger_file_is_not_capped() {
+    let fixture_path = ensure_large_fixture();
+    let source = LocalFileSource::new(fixture_path).expect("large fixture must exist");
+
+    let mut engine = QueryEngine::new();
+    engine
+        .register_source(&source)
+        .await
+        .expect("register_source must succeed");
+
+    let (meta, _ipc_bytes) = engine
+        .execute("select * from data limit 100")
+        .await
+        .expect("execute must succeed");
+
+    assert_eq!(
+        meta.total_rows, 100,
+        "`limit 100` must return exactly 100 rows, got {}",
+        meta.total_rows
+    );
+    assert!(
+        !meta.capped,
+        "`select * from data limit 100` yields a COMPLETE 100-row result — the backend \
+         discarded nothing, so `capped` must be false; a complete result at the cap is \
+         not truncated (WR-06)"
     );
 }
 
