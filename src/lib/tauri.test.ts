@@ -13,15 +13,18 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
 }));
 
-import { tableFromArrays } from "apache-arrow";
+import { tableFromArrays, tableToIPC } from "apache-arrow";
 import { invoke } from "@tauri-apps/api/core";
 import {
   arrowTableToRows,
+  decodeQueryFrame,
   dedupeFieldKeys,
   displayColumnName,
   openRemoteFile,
+  runQuery,
   type RemoteConnection,
   type OpenFileResponse,
+  type SchemaField,
 } from "./tauri";
 
 const mockInvoke = vi.mocked(invoke);
@@ -187,5 +190,103 @@ describe("arrowTableToRows", () => {
       { id: "1", ratio: 1.5 },
       { id: "2", ratio: 2.5 },
     ]);
+  });
+});
+
+/**
+ * Assembles the same frame `src-tauri/src/ipc/frame.rs::frame_meta_and_bytes` produces:
+ * `[u32 LE meta_len][meta JSON][arrow IPC bytes]`.
+ *
+ * Written by hand rather than shared with the decoder so a change to the layout has to
+ * be made in two places to pass — a decoder-only regression cannot self-approve.
+ */
+function buildFrame(meta: unknown, arrowBytes: Uint8Array): ArrayBuffer {
+  const json = new TextEncoder().encode(JSON.stringify(meta));
+  const frame = new ArrayBuffer(4 + json.byteLength + arrowBytes.byteLength);
+
+  new DataView(frame).setUint32(0, json.byteLength, true);
+  const out = new Uint8Array(frame);
+  out.set(json, 4);
+  out.set(arrowBytes, 4 + json.byteLength);
+
+  return frame;
+}
+
+const TWO_COLUMN_SCHEMA: SchemaField[] = [
+  { name: "id", arrow_type: "Int64", nullable: false },
+  { name: "ratio", arrow_type: "Float64", nullable: true },
+];
+
+describe("decodeQueryFrame", () => {
+  it("decodes rows and metadata from a single framed response", () => {
+    const arrow = tableToIPC(
+      tableFromArrays({
+        id: BigInt64Array.from([1n, 2n]),
+        ratio: Float64Array.from([1.5, 2.5]),
+      })
+    );
+    const frame = buildFrame(
+      { total_rows: 2, capped: false, schema: TWO_COLUMN_SCHEMA },
+      arrow
+    );
+
+    const result = decodeQueryFrame(frame);
+
+    expect(result.rows).toEqual([
+      { id: "1", ratio: 1.5 },
+      { id: "2", ratio: 2.5 },
+    ]);
+    expect(result.total_rows).toBe(2);
+    expect(result.capped).toBe(false);
+    expect(result.schema).toEqual(TWO_COLUMN_SCHEMA);
+  });
+
+  it("takes total_rows and capped from the frame metadata when the arrow body is empty", () => {
+    // IN-03: the zero-byte branch used to hardcode `total_rows: 0, capped: false`.
+    // `capped: true` is the combination that makes a regression to those literals fail.
+    const schema: SchemaField[] = [{ name: "id", arrow_type: "Int64", nullable: false }];
+    const frame = buildFrame(
+      { total_rows: 0, capped: true, schema },
+      new Uint8Array(0)
+    );
+
+    const result = decodeQueryFrame(frame);
+
+    expect(result.rows).toEqual([]);
+    expect(result.total_rows).toBe(0);
+    expect(result.capped).toBe(true);
+    expect(result.schema).toEqual(schema);
+  });
+
+  it("throws on a frame shorter than the 4-byte length prefix", () => {
+    expect(() => decodeQueryFrame(new ArrayBuffer(2))).toThrow(
+      /Malformed query response/
+    );
+  });
+
+  it("throws when the declared metadata length exceeds the response size", () => {
+    // A well-formed prefix claiming more JSON than the buffer holds — a truncated
+    // response must fail explicitly rather than slice out of bounds (T-02-14).
+    const frame = new ArrayBuffer(12);
+    new DataView(frame).setUint32(0, 9999, true);
+
+    expect(() => decodeQueryFrame(frame)).toThrow(/Malformed query response/);
+  });
+});
+
+describe("runQuery IPC contract (WR-03)", () => {
+  it("performs exactly one invoke, with 'run_query' and { sql }", async () => {
+    const frame = buildFrame(
+      { total_rows: 0, capped: false, schema: [] },
+      new Uint8Array(0)
+    );
+    mockInvoke.mockResolvedValueOnce(frame);
+
+    await runQuery("select 1");
+
+    // Two round-trips (run_query + get_last_result_meta) is exactly the
+    // desynchronisation window WR-03 describes; one call proves it is closed.
+    expect(mockInvoke).toHaveBeenCalledTimes(1);
+    expect(mockInvoke).toHaveBeenCalledWith("run_query", { sql: "select 1" });
   });
 });
