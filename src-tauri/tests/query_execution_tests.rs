@@ -14,8 +14,8 @@
 //! Test 5 (IPC round-trip): `record_batches_to_ipc(&batches)` produces a non-empty `Vec<u8>`
 //!   that begins with the Arrow IPC magic bytes (decodable by an Arrow IPC reader).
 
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
 use datafusion::arrow::array::{Array, Float64Array, Int64Array, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
@@ -32,15 +32,43 @@ const SMALL_FIXTURE_PATH: &str = "tests/fixtures/sample.parquet";
 /// Path to the exactly-at-the-cap fixture (exactly ROW_CAP == 100 rows).
 const EXACT_100_FIXTURE_PATH: &str = "tests/fixtures/exact_100.parquet";
 
+// WR-04 (phase 02 review): fixture creation is synchronized on two levels.
+//
+// 1. Each `ensure_*` helper is guarded by a `OnceLock`, so this binary's parallel
+//    `#[tokio::test]` threads create a given fixture at most once. The old
+//    unsynchronized exists()-then-create let two tests both observe `!exists` and
+//    write the same path concurrently (`File::create` truncates), so a third test
+//    could open a half-written Parquet file and fail on the footer — a
+//    first-run/CI flake that vanished on retry.
+// 2. Each `create_*` writer emits to a unique temp sibling and atomically
+//    `fs::rename`s it into place, so no OTHER process (another test binary that
+//    shares a fixture, or a per-test-process runner) can ever observe a torn file.
+
+/// Returns a unique sibling temp path for `path` — same directory, therefore the
+/// same filesystem, so the final `fs::rename` into place is atomic (WR-04).
+fn unique_tmp_sibling(path: &Path) -> PathBuf {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    path.with_extension(format!("tmp-{}-{}", std::process::id(), nanos))
+}
+
 /// Creates a large Parquet fixture with 150 rows (3 columns: id Int64, label Utf8, score Float64).
 fn ensure_large_fixture() -> PathBuf {
-    let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(LARGE_FIXTURE_PATH);
+    static LARGE_FIXTURE: OnceLock<PathBuf> = OnceLock::new();
 
-    if !fixture_path.exists() {
-        create_large_fixture(&fixture_path);
-    }
-
-    fixture_path
+    LARGE_FIXTURE
+        .get_or_init(|| {
+            let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(LARGE_FIXTURE_PATH);
+            if !fixture_path.exists() {
+                create_large_fixture(&fixture_path);
+            }
+            fixture_path
+        })
+        .clone()
 }
 
 /// Writes a 150-row Parquet fixture for cap-related tests.
@@ -88,10 +116,14 @@ fn create_large_fixture(path: &PathBuf) {
     )
     .unwrap();
 
-    let file = File::create(path).unwrap();
+    // WR-04: write to a unique temp sibling, then atomically rename into place, so
+    // no concurrent reader (thread or process) can ever open a half-written file.
+    let tmp = unique_tmp_sibling(path);
+    let file = File::create(&tmp).unwrap();
     let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
     writer.write(&batch).unwrap();
     writer.close().unwrap();
+    std::fs::rename(&tmp, path).unwrap();
 }
 
 /// Creates a Parquet fixture holding EXACTLY 100 rows — the same count as the
@@ -101,13 +133,18 @@ fn create_large_fixture(path: &PathBuf) {
 /// Same three columns as the large fixture (id Int64 non-null, label Utf8
 /// nullable, score Float64 nullable) so the two are interchangeable in queries.
 fn ensure_exact_100_fixture() -> PathBuf {
-    let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(EXACT_100_FIXTURE_PATH);
+    static EXACT_100_FIXTURE: OnceLock<PathBuf> = OnceLock::new();
 
-    if !fixture_path.exists() {
-        create_exact_100_fixture(&fixture_path);
-    }
-
-    fixture_path
+    EXACT_100_FIXTURE
+        .get_or_init(|| {
+            let fixture_path =
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(EXACT_100_FIXTURE_PATH);
+            if !fixture_path.exists() {
+                create_exact_100_fixture(&fixture_path);
+            }
+            fixture_path
+        })
+        .clone()
 }
 
 /// Writes a 100-row Parquet fixture for cap-accuracy tests.
@@ -145,21 +182,33 @@ fn create_exact_100_fixture(path: &PathBuf) {
 
     let batch = RecordBatch::try_new(schema.clone(), vec![id_arr, label_arr, score_arr]).unwrap();
 
-    let file = File::create(path).unwrap();
+    // WR-04: write to a unique temp sibling, then atomically rename into place, so
+    // no concurrent reader (thread or process) can ever open a half-written file.
+    let tmp = unique_tmp_sibling(path);
+    let file = File::create(&tmp).unwrap();
     let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
     writer.write(&batch).unwrap();
     writer.close().unwrap();
+    std::fs::rename(&tmp, path).unwrap();
 }
 
 /// Returns the path to the small (5-row) fixture from Plan 01.
 fn small_fixture_path() -> PathBuf {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(SMALL_FIXTURE_PATH);
-    // The small fixture is created by Plan 01's storage_engine_tests.rs ensure_fixture().
-    // If it doesn't exist yet, create it here too.
-    if !path.exists() {
-        create_small_fixture(&path);
-    }
-    path
+    static SMALL_FIXTURE: OnceLock<PathBuf> = OnceLock::new();
+
+    SMALL_FIXTURE
+        .get_or_init(|| {
+            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(SMALL_FIXTURE_PATH);
+            // The small fixture is created by Plan 01's storage_engine_tests.rs
+            // ensure_fixture(). If it doesn't exist yet, create it here too — the
+            // temp-then-rename write keeps that cross-binary sharing torn-file-free
+            // (WR-04).
+            if !path.exists() {
+                create_small_fixture(&path);
+            }
+            path
+        })
+        .clone()
 }
 
 fn create_small_fixture(path: &PathBuf) {
@@ -192,10 +241,14 @@ fn create_small_fixture(path: &PathBuf) {
 
     let batch = RecordBatch::try_new(schema.clone(), vec![ids, names, values]).unwrap();
 
-    let file = File::create(path).unwrap();
+    // WR-04: write to a unique temp sibling, then atomically rename into place, so
+    // no concurrent reader (thread or process) can ever open a half-written file.
+    let tmp = unique_tmp_sibling(path);
+    let file = File::create(&tmp).unwrap();
     let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
     writer.write(&batch).unwrap();
     writer.close().unwrap();
+    std::fs::rename(&tmp, path).unwrap();
 }
 
 // ---------------------------------------------------------------------------
