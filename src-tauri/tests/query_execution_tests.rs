@@ -1287,3 +1287,58 @@ async fn test_get_page_slices_from_cached_result() {
     );
     assert!(!last_page.has_more, "has_more must be false at the end of the 100-row cache");
 }
+
+/// WR-03 (phase 02 review): duplicate result column names must NOT collapse into
+/// one JSON key. `select id, value as id` used to serialize both columns under the
+/// key `"id"`, and `serde_json` kept only the last one — silently dropping a
+/// column. The page channel must expose the same positional `__N` dedupe scheme
+/// as the frontend's `dedupeFieldKeys` (D-PH1-03).
+#[tokio::test]
+async fn test_get_page_disambiguates_duplicate_column_names() {
+    let fixture_path = small_fixture_path();
+    let source = LocalFileSource::new(fixture_path).expect("small fixture must exist");
+
+    let mut engine = QueryEngine::new();
+    engine
+        .register_source(&source)
+        .await
+        .expect("register_source must succeed");
+
+    // Two result columns BOTH named `id`: a self-join projects `a.id` and `b.id`,
+    // whose FIELD names are identical — the exact shape the frontend's
+    // `dedupeFieldKeys` was built for. The offset join condition makes the two
+    // columns carry DIFFERENT values (1 vs 2), so the assertions can prove which
+    // column each key resolves to (small fixture: id=1..5).
+    engine
+        .execute(
+            "select a.id, b.id from data a \
+             join data b on b.id = a.id + 1 where a.id = 1",
+        )
+        .await
+        .expect("execute must succeed");
+
+    let page = engine.get_page(0, 5).expect("get_page must succeed");
+    assert_eq!(page.rows.len(), 1, "the id=1 predicate must match exactly one row");
+
+    let row = page.rows[0]
+        .as_object()
+        .expect("each page row must be a JSON object");
+
+    assert_eq!(
+        row.get("id"),
+        Some(&serde_json::json!(1)),
+        "the FIRST duplicate column keeps its raw name and its own values (WR-03)"
+    );
+    assert_eq!(
+        row.get("id__2"),
+        Some(&serde_json::json!(2)),
+        "the SECOND duplicate column must survive under the deduped key `id__2` — \
+         not silently overwrite (or be overwritten by) the first (WR-03)"
+    );
+    assert_eq!(
+        row.len(),
+        2,
+        "exactly two keys must be present for two result columns, got {:?}",
+        row.keys().collect::<Vec<_>>()
+    );
+}

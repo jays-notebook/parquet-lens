@@ -443,6 +443,17 @@ fn view_free_field(f: &Field) -> Option<Field> {
 /// Converts a `RecordBatch` into a `Vec<serde_json::Value>` row objects.
 ///
 /// Uses DataFusion's Arrow JSON writer re-export (PITFALLS.md §Pitfall 3).
+///
+/// # Duplicate column names (phase 02 review, WR-03)
+///
+/// `ArrayWriter` keys cells by the raw column name, so a result with duplicate
+/// names — `select a, b as a from data` — produced JSON objects with duplicate
+/// keys, and `serde_json` kept only the LAST occurrence: one column's values
+/// silently replaced the other's. Column names are therefore disambiguated
+/// positionally BEFORE serialization, with the same `__N`-suffix scheme the
+/// frontend applies to the Arrow IPC channel (`dedupeFieldKeys` in
+/// `src/lib/tauri.ts`, D-PH1-03), so both row channels expose duplicate columns
+/// identically instead of dropping data.
 fn record_batch_to_json_rows(
     batch: &RecordBatch,
 ) -> Result<Vec<serde_json::Value>, String> {
@@ -452,11 +463,37 @@ fn record_batch_to_json_rows(
         return Ok(Vec::new());
     }
 
+    // Rebuild the batch under deduped column names when (and only when) the
+    // result schema contains duplicates (WR-03). Types, nullability, metadata
+    // and the column arrays themselves are untouched — only names change.
+    let schema = batch.schema();
+    let names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+    let deduped = dedupe_field_names(&names);
+
+    let renamed_batch: RecordBatch;
+    let write_batch: &RecordBatch = if deduped == names {
+        batch
+    } else {
+        let new_fields: Vec<Field> = schema
+            .fields()
+            .iter()
+            .zip(deduped.iter())
+            .map(|(f, name)| f.as_ref().clone().with_name(name))
+            .collect();
+        let new_schema = Arc::new(Schema::new_with_metadata(
+            new_fields,
+            schema.metadata().clone(),
+        ));
+        renamed_batch = RecordBatch::try_new(new_schema, batch.columns().to_vec())
+            .map_err(|e| format!("Failed to rebuild page batch with deduped names: {}", e))?;
+        &renamed_batch
+    };
+
     let mut buf = Vec::new();
     {
         let mut writer = ArrayWriter::new(&mut buf);
         writer
-            .write(batch)
+            .write(write_batch)
             .map_err(|e| format!("JSON write error: {}", e))?;
         writer
             .finish()
@@ -467,4 +504,39 @@ fn record_batch_to_json_rows(
         serde_json::from_slice(&buf).map_err(|e| format!("JSON parse error: {}", e))?;
 
     Ok(rows)
+}
+
+/// Returns positionally deduped column names: the first occurrence of a name is
+/// kept verbatim, later occurrences get `__2`, `__3`, ... suffixes, probing
+/// forward when a source column literally carries an already-taken probed name.
+///
+/// MUST stay behaviourally identical to `dedupeFieldKeys` in `src/lib/tauri.ts`
+/// (D-PH1-03): the frontend applies this scheme to the Arrow IPC channel, and the
+/// `get_page` JSON channel must expose the same keys for the same result (WR-03).
+fn dedupe_field_names(names: &[String]) -> Vec<String> {
+    use std::collections::{HashMap, HashSet};
+
+    // Occurrence counter per source name, and every key already handed out.
+    let mut seen: HashMap<&str, usize> = HashMap::new();
+    let mut used: HashSet<String> = HashSet::new();
+
+    names
+        .iter()
+        .map(|name| {
+            let mut count = seen.get(name.as_str()).copied().unwrap_or(0) + 1;
+            let mut key = if count == 1 {
+                name.clone()
+            } else {
+                format!("{name}__{count}")
+            };
+            // Probe forward: a source column may literally be named `{name}__{count}`.
+            while used.contains(&key) {
+                count += 1;
+                key = format!("{name}__{count}");
+            }
+            seen.insert(name.as_str(), count);
+            used.insert(key.clone());
+            key
+        })
+        .collect()
 }
