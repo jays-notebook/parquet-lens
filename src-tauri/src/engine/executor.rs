@@ -16,8 +16,8 @@
 use std::sync::Arc;
 
 use datafusion::arrow::array::RecordBatch;
-use datafusion::arrow::compute::{cast, concat_batches};
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::arrow::compute::{can_cast_types, cast, concat_batches};
+use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
 use futures::StreamExt;
 
 use crate::engine::QueryEngine;
@@ -238,21 +238,41 @@ impl QueryEngine {
 ///
 /// # Mapping
 ///
+/// The rewrite applies at **every nesting depth**, not only at the top level (WR-05).
+/// A `List(Utf8View)` child blanks the grid exactly like a top-level `Utf8View` column
+/// does, so a top-level-only match would leave the stated guarantee false.
+///
 /// | Source type      | Target type  |
 /// |------------------|--------------|
 /// | `Utf8View`       | `Utf8`       |
 /// | `BinaryView`     | `Binary`     |
 /// | everything else  | unchanged    |
 ///
+/// Container types are recursed into and rebuilt around their rewritten children:
+/// `List`, `LargeList`, `ListView`, `LargeListView`, `FixedSizeList` (size preserved),
+/// `Struct` (unchanged children kept as-is), `Map` (`sorted` flag preserved),
+/// `Dictionary` (key type preserved, value type rewritten) and `RunEndEncoded`.
+///
+/// # Metadata
+///
+/// Field-level and schema-level Arrow metadata survive the rewrite (IN-01): fields are
+/// rebuilt with `Field::with_data_type` (which keeps name, nullability AND metadata) and
+/// the schema with `Schema::new_with_metadata`.  Previously a rewrite triggered by one
+/// view column silently stripped metadata from every other column too.
+///
 /// # Fast path
 ///
-/// If no column in `batches[0].schema()` is a view type the input `Vec` is returned
-/// unchanged — no allocation, no casting.
+/// If no column in `batches[0].schema()` contains a view type at any depth the input
+/// `Vec` is returned unchanged — no allocation, no casting.
 ///
 /// # Errors
 ///
-/// Returns `Err(String)` if Arrow's `cast` kernel fails or if `RecordBatch::try_new`
-/// rejects the rebuilt batch.  Never panics.
+/// Returns `Err(String)` if the Arrow cast kernel does not support a required cast
+/// (checked up-front with `can_cast_types`, naming the column and both types), if the
+/// `cast` kernel itself fails, or if `RecordBatch::try_new` rejects the rebuilt batch.
+/// Failing loudly is deliberate: silently shipping a view-typed column produces
+/// `"Unrecognized type: undefined (24)"` in apache-arrow JS v21 and an empty grid with
+/// no explanation.  Never panics.
 pub fn normalize_view_types(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>, String> {
     if batches.is_empty() {
         return Ok(Vec::new());
@@ -260,33 +280,31 @@ pub fn normalize_view_types(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch
 
     let orig_schema = batches[0].schema();
 
-    // Build the list of target field types, mapping view types to non-view equivalents.
+    // Build the target fields, rewriting view types at any depth.
+    // `view_free_field` returns None when the field is already view-free.
     let mut any_changed = false;
     let new_fields: Vec<Field> = orig_schema
         .fields()
         .iter()
-        .map(|f| {
-            let target_dt = match f.data_type() {
-                DataType::Utf8View => {
-                    any_changed = true;
-                    DataType::Utf8
-                }
-                DataType::BinaryView => {
-                    any_changed = true;
-                    DataType::Binary
-                }
-                other => other.clone(),
-            };
-            Field::new(f.name(), target_dt, f.is_nullable())
+        .map(|f| match view_free_field(f) {
+            Some(rewritten) => {
+                any_changed = true;
+                rewritten
+            }
+            None => f.as_ref().clone(),
         })
         .collect();
 
-    // Fast path: no view-typed columns found.
+    // Fast path: no view-typed columns found at any depth.
     if !any_changed {
         return Ok(batches);
     }
 
-    let new_schema: SchemaRef = Arc::new(Schema::new(new_fields));
+    // new_with_metadata (not Schema::new) so schema-level key/value pairs survive (IN-01).
+    let new_schema: SchemaRef = Arc::new(Schema::new_with_metadata(
+        new_fields,
+        orig_schema.metadata().clone(),
+    ));
 
     // Rebuild each batch, casting only the columns whose type changed.
     batches
@@ -300,6 +318,16 @@ pub fn normalize_view_types(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch
                     let col = batch.column(i);
                     let target_dt = new_schema.field(i).data_type();
                     if target_dt != f.data_type() {
+                        // Guard before casting: an unsupported nested cast must surface as
+                        // a named error, never as undecodable IPC bytes on the wire.
+                        if !can_cast_types(f.data_type(), target_dt) {
+                            return Err(format!(
+                                "cannot normalize view type on column '{}': no Arrow cast from {:?} to {:?}",
+                                f.name(),
+                                f.data_type(),
+                                target_dt
+                            ));
+                        }
                         cast(col.as_ref(), target_dt)
                             .map_err(|e| format!("cast error on column '{}': {}", f.name(), e))
                     } else {
@@ -313,6 +341,75 @@ pub fn normalize_view_types(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch
                 .map_err(|e| format!("RecordBatch rebuild error: {}", e))
         })
         .collect()
+}
+
+/// Returns the view-free rewrite of `dt`, or `None` when `dt` already contains no
+/// view type at any depth.
+///
+/// `None` (rather than an unconditional clone) is what powers the fast path in
+/// `normalize_view_types`: an unchanged type costs no allocation and no cast.
+fn view_free_data_type(dt: &DataType) -> Option<DataType> {
+    match dt {
+        DataType::Utf8View => Some(DataType::Utf8),
+        DataType::BinaryView => Some(DataType::Binary),
+
+        // Single-child list containers: rebuild the same variant around the rewritten child.
+        DataType::List(f) => view_free_field(f).map(|nf| DataType::List(Arc::new(nf))),
+        DataType::LargeList(f) => view_free_field(f).map(|nf| DataType::LargeList(Arc::new(nf))),
+        DataType::ListView(f) => view_free_field(f).map(|nf| DataType::ListView(Arc::new(nf))),
+        DataType::LargeListView(f) => {
+            view_free_field(f).map(|nf| DataType::LargeListView(Arc::new(nf)))
+        }
+        // Fixed size must be carried over verbatim.
+        DataType::FixedSizeList(f, size) => {
+            view_free_field(f).map(|nf| DataType::FixedSizeList(Arc::new(nf), *size))
+        }
+
+        // Struct: rebuild only if at least one child changed; unchanged children are
+        // reused by Arc clone so their metadata is untouched.
+        DataType::Struct(fields) => {
+            let mut any_changed = false;
+            let new_fields: Vec<FieldRef> = fields
+                .iter()
+                .map(|f| match view_free_field(f) {
+                    Some(rewritten) => {
+                        any_changed = true;
+                        Arc::new(rewritten)
+                    }
+                    None => Arc::clone(f),
+                })
+                .collect();
+
+            if any_changed {
+                Some(DataType::Struct(new_fields.into()))
+            } else {
+                None
+            }
+        }
+
+        // Map: the `sorted` flag is part of the type and must be preserved.
+        DataType::Map(entries, sorted) => {
+            view_free_field(entries).map(|nf| DataType::Map(Arc::new(nf), *sorted))
+        }
+
+        // Dictionary: only the value type can be a view type; keep the key type as-is.
+        DataType::Dictionary(key, value) => view_free_data_type(value)
+            .map(|nv| DataType::Dictionary(key.clone(), Box::new(nv))),
+
+        DataType::RunEndEncoded(run_ends, values) => view_free_field(values)
+            .map(|nf| DataType::RunEndEncoded(Arc::clone(run_ends), Arc::new(nf))),
+
+        _ => None,
+    }
+}
+
+/// Returns the view-free rewrite of `f`, or `None` when its type is already view-free.
+///
+/// Uses `Field::with_data_type` specifically: it preserves the field's name, nullability
+/// AND metadata.  The previous `Field::new(f.name(), dt, f.is_nullable())` construction
+/// silently dropped field metadata (IN-01).
+fn view_free_field(f: &Field) -> Option<Field> {
+    view_free_data_type(f.data_type()).map(|new_dt| f.clone().with_data_type(new_dt))
 }
 
 /// Converts a `RecordBatch` into a `Vec<serde_json::Value>` row objects.
