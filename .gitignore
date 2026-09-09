@@ -29,3 +29,9 @@ CLAUDE.md
 # Environment
 .env
 .env.local
+
+# Agent artifacts managed in the sibling agent-settings repository
+/AGENTS.md
+/AGENTS.override.md
+/.codex
+/.agents
