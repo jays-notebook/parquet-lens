@@ -1,10 +1,9 @@
 name: CI
 
-# Run the test suites on every push to `main` and every pull request targeting
-# `main`, so a regression is caught before it lands rather than on the next
-# developer's machine.
+# Run checks only when application inputs change. Keep the event paths below
+# in sync with the per-job filters in `changes`. See docs/ci.md for the policy.
 #
-# Scope: tests only. Installer builds (Windows .exe/.msi, macOS .dmg) live in
+# Scope: tests and frontend compilation only. Installer builds (Windows .exe/.msi, macOS .dmg) live in
 # `release.yml` and fire on `v*` tags — nothing here produces a bundle.
 #
 # The backend matrix is deliberately Windows + macOS with no Linux leg: on
@@ -14,8 +13,64 @@ name: CI
 on:
   push:
     branches: [main]
+    paths:
+      - 'src/**'
+      - 'public/**'
+      - 'index.html'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'npm-shrinkwrap.json'
+      - '.npmrc'
+      - '.node-version'
+      - '.nvmrc'
+      - 'tsconfig*.json'
+      - 'vite.config.*'
+      - 'vitest.config.*'
+      - 'tailwind.config.*'
+      - 'postcss.config.*'
+      - '.env'
+      - '.env.*'
+      - 'src-tauri/**'
+      - '.cargo/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain'
+      - 'rust-toolchain.toml'
+      - 'rustfmt.toml'
+      - '.rustfmt.toml'
+      - '.github/workflows/ci.yml'
+      - '!**/*.md'
+      - '!**/*.mdx'
   pull_request:
     branches: [main]
+    paths:
+      - 'src/**'
+      - 'public/**'
+      - 'index.html'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'npm-shrinkwrap.json'
+      - '.npmrc'
+      - '.node-version'
+      - '.nvmrc'
+      - 'tsconfig*.json'
+      - 'vite.config.*'
+      - 'vitest.config.*'
+      - 'tailwind.config.*'
+      - 'postcss.config.*'
+      - '.env'
+      - '.env.*'
+      - 'src-tauri/**'
+      - '.cargo/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain'
+      - 'rust-toolchain.toml'
+      - 'rustfmt.toml'
+      - '.rustfmt.toml'
+      - '.github/workflows/ci.yml'
+      - '!**/*.md'
+      - '!**/*.mdx'
 
 # This workflow publishes nothing, so the token needs no write scope.
 # (release.yml is the one that needs `contents: write`.)
@@ -31,7 +86,64 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  changes:
+    name: Detect affected checks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      frontend: ${{ steps.filter.outputs.frontend }}
+      backend: ${{ steps.filter.outputs.backend }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Classify changed files
+        id: filter
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
+        with:
+          # Push: compare with the tip before the entire push, not HEAD^.
+          # PR: the action uses the PR file list, including fork PRs.
+          base: ${{ github.ref }}
+          predicate-quantifier: some-with-excludes
+          filters: |
+              frontend:
+                - 'src/**'
+                - 'public/**'
+                - 'index.html'
+                - 'package.json'
+                - 'package-lock.json'
+                - 'npm-shrinkwrap.json'
+                - '.npmrc'
+                - '.node-version'
+                - '.nvmrc'
+                - 'tsconfig*.json'
+                - 'vite.config.*'
+                - 'vitest.config.*'
+                - 'tailwind.config.*'
+                - 'postcss.config.*'
+                - '.env'
+                - '.env.*'
+                - '.github/workflows/ci.yml'
+                - '!**/*.md'
+                - '!**/*.mdx'
+              backend:
+                - 'src-tauri/**'
+                - '.cargo/**'
+                - 'Cargo.toml'
+                - 'Cargo.lock'
+                - 'rust-toolchain'
+                - 'rust-toolchain.toml'
+                - 'rustfmt.toml'
+                - '.rustfmt.toml'
+                - '.github/workflows/ci.yml'
+                - '!**/*.md'
+                - '!**/*.mdx'
+
   frontend:
+    needs: changes
+    if: needs.changes.outputs.frontend == 'true'
     name: Frontend tests (vitest)
     runs-on: ubuntu-latest
 
@@ -54,7 +166,12 @@ jobs:
       - name: Run vitest suite
         run: npm test
 
+      - name: Check types and build frontend
+        run: npm run build
+
   backend:
+    needs: changes
+    if: needs.changes.outputs.backend == 'true'
     name: Backend tests (cargo)
     strategy:
       # A macOS-only failure should still report the Windows result, and vice
