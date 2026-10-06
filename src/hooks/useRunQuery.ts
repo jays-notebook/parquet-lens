@@ -11,30 +11,15 @@
  * otherwise bypass the disabled button and query an unregistered table.
  */
 import { useCallback } from "react";
-import { useShallow } from "zustand/react/shallow";
 import { runQuery } from "../lib/tauri";
 import { useAppStore } from "../store/appStore";
 
 export function useRunQuery() {
-  const {
-    queryText,
-    isLoading,
-    setLoading,
-    setResults,
-    setQueryError,
-    registrationStatus,
-  } = useAppStore(
-    useShallow((s) => ({
-      queryText: s.queryText,
-      isLoading: s.isLoading,
-      setLoading: s.setLoading,
-      setResults: s.setResults,
-      setQueryError: s.setQueryError,
-      registrationStatus: s.registrationStatus,
-    }))
-  );
-
   const runQueryHandler = useCallback(async () => {
+    // Check live state so callbacks from an earlier render cannot bypass the gate.
+    const {
+      queryText, isLoading, registrationStatus, setLoading, setResults, setQueryError,
+    } = useAppStore.getState();
     if (isLoading || registrationStatus !== "registered") return;
 
     setLoading(true);
@@ -51,7 +36,7 @@ export function useRunQuery() {
       // throws — a finally removes the whole class of stuck-loading leaks.
       setLoading(false);
     }
-  }, [queryText, isLoading, registrationStatus, setLoading, setResults, setQueryError]);
+  }, []);
 
   return { runQueryHandler };
 }
