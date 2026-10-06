@@ -67,10 +67,11 @@ Row Groups 탭에서 row group별로 이를 표시합니다.
   기록합니다. `WHERE col_a > 1000`이라면, `col_a` 최댓값이 1000 이하인 row group은 값 하나도
   디코딩하지 않고 건너뛸 수 있습니다.
 
-이 앱의 100행 스트림 정지(
-[DataFusion & Arrow §3](./02-datafusion-and-arrow.md#3-스트리밍-실행과-100행-캡) 참고)와 결합하면,
-멀티 GB 파일을 열어 미리 보는 작업이 저렴하게 유지됩니다: 엔진은 footer를 읽은 뒤, 앞쪽 100행을
-만드는 데 필요한 열/row group 바이트만 읽습니다.
+These optimizations can reduce the cost of previews, but the app's
+[100-row result cap](./02-datafusion-and-arrow.md#3-스트리밍-실행과-100행-캡)
+does not guarantee that only 100 input rows, or a fixed number of row groups,
+are read. Sorting and aggregation may require a much larger scan. Actual
+work depends on the query, Parquet layout, and available local resources.
 
 ## 4. Footer: 마지막에 있지만 가장 먼저 읽는다
 

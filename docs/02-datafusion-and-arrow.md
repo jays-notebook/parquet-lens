@@ -37,7 +37,7 @@ DB 서버도, 외부 프로세스도, 네트워크 홉도 없습니다 — 독�
 
 ```
 SQL 문자열
-   │  SessionContext::sql(sql)
+   │  SessionContext::sql_with_options(sql, read_only_options)
    ▼
 LogicalPlan      ← 파싱 + 등록된 테이블 스키마에 대해 검증
    │  optimizer
@@ -69,51 +69,46 @@ Stream<RecordBatch>   ← 배치를 필요에 따라 지연 생성
 
 ## 3. 스트리밍 실행과 100행 캡
 
-이것이 앱의 성능적 심장입니다. 실행기(`src-tauri/src/engine/executor.rs`)는 **절대 `.collect()`를
-호출하지 않습니다** — collect는 결과 전체를 메모리에 구체화하므로, GB급 파일에서는 목적을
-무너뜨립니다.
+The executor (`src-tauri/src/engine/executor.rs`) uses
+`DataFrame::execute_stream()` rather than collecting the full query result.
+It retains at most 100 rows, slicing the last batch when necessary.
 
-대신 `DataFrame::execute_stream()`을 사용해 배치를 100행이 될 때까지 끌어오고, 그 시점에 멈춥니다:
+- If a batch contains more rows than the remaining capacity, the executor
+  retains only the slice that fits and reports `capped: true`.
+- If the retained count reaches exactly 100, it checks for another non-empty
+  batch. End of stream means `capped: false`; another non-empty batch means
+  `capped: true`. Empty batches are skipped during this check.
+- An error during that post-cap check conservatively reports `capped: true`
+  and preserves the 100 rows already obtained. Earlier stream errors fail
+  the query.
 
-```rust
-const ROW_CAP: usize = 100;
+A complete result of exactly 100 rows, including the default `LIMIT 100`
+query, is therefore not marked as truncated. `total_rows` is the retained
+result count, not the total number of matching rows in the source.
 
-let mut stream = df.execute_stream().await?;
-'drain: while let Some(batch) = stream.next().await {
-    let batch = batch?;
-    let remaining = ROW_CAP.saturating_sub(total_rows);
-    if batch.num_rows() <= remaining {
-        total_rows += batch.num_rows();
-        retained_batches.push(batch);
-    } else {
-        retained_batches.push(batch.slice(0, remaining)); // 마지막 배치를 잘라 정확히 100행
-        capped = true;
-        break 'drain;
-    }
-    if total_rows >= ROW_CAP { capped = true; break 'drain; }
-}
-```
-
-실행이 지연(lazy)되고 스캔으로 pushdown되므로, 일찍 멈춘다는 것은 엔진이 그 앞쪽 100행을
-만들기 위해 필요한 row group과 열만 읽는다는 뜻입니다. `capped` 플래그는 캡을 넘어 더 많은 행이
-있었는지를 UI에 알려줍니다.
+This is a **result-row limit**, not a fixed memory, CPU, or time budget.
+Projection and predicate pushdown can reduce work, but sorting, aggregation,
+and other query plans may process much more input before returning results.
+Execution cost depends on the data, query, and user's local hardware; the
+app adds no automatic query timeout or fixed engine memory budget.
 
 ## 4. Arrow 데이터를 프론트엔드로 옮기기
 
 직렬화 경로는 두 가지이며, 모두 `datafusion::arrow::*` re-export를 통해서만 접근합니다(직접
 `arrow` 크레이트 사용 금지 — §6 참고):
 
-- **Arrow IPC 스트림(행 데이터 경로)** — `src-tauri/src/ipc/serializer.rs`가 `StreamWriter`로
-  `&[RecordBatch]`를 Arrow IPC 스트림 바이트로 변환합니다. 이 바이트는 바이너리 IPC 채널로
-  반환되며 프론트엔드에서 `apache-arrow`의 `tableFromIPC()`로 디코딩됩니다. 포맷이
-  자기 기술적(self-describing)이라 스키마를 함께 담으므로, 프론트엔드는 추가 메타데이터 없이
-  정확한 컬럼나 테이블을 복원합니다.
+- **Arrow IPC stream (query rows)** — `src-tauri/src/ipc/serializer.rs` uses
+  `StreamWriter` to serialize retained batches. These bytes are the final
+  segment of the framed `run_query` response. `decodeQueryFrame` extracts
+  them before passing them to `tableFromIPC()`. The Arrow stream carries
+  its own schema for decoding, while the frame's JSON result schema supplies
+  the grid's column names and type labels, including for zero-row results.
 
 - **Arrow JSON(페이징 경로)** — `get_page`는 슬라이스된 `RecordBatch`를 Arrow의 `ArrayWriter`로
   `serde_json::Value` 행 객체로 변환합니다. 이미 캡이 적용된 작은 캐시에만 사용됩니다.
 
-행 데이터가 바이너리 채널을, 메타데이터가 JSON을 쓰는 이유는
-[Tauri & IPC §5](./01-tauri-and-ipc.md#5-2채널-직렬화-전략)를 참고하세요.
+See [Tauri & IPC §5](./01-tauri-and-ipc.md#5-single-response-framing) for the
+single-response layout containing JSON metadata and Arrow IPC rows.
 
 ## 5. view 타입 함정 (Utf8View / BinaryView)
 

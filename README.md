@@ -1,6 +1,6 @@
 # Parquet Lens
 
-Parquet 파일을 **SQL로 즉시 탐색**할 수 있는 Windows 데스크톱 GUI 애플리케이션입니다.
+Parquet Lens is a desktop GUI for exploring Parquet files with SQL on Windows and macOS.
 파일을 열면 곧바로 `SELECT` 쿼리로 내용을 들여다보고, 결과를 그리드에서 확인할 수 있습니다.
 
 > **핵심 가치:** Parquet 파일을 열고, 바로 SQL로 그 안을 살펴본다.
@@ -12,14 +12,14 @@ Parquet 파일을 **SQL로 즉시 탐색**할 수 있는 Windows 데스크톱 GU
 - **SQL 기반 탐색** — 열린 Parquet 파일은 `data`라는 테이블로 등록되며, `SELECT` 쿼리를 작성해 조회합니다 (읽기 전용).
 - **파일 열기** — 파일 다이얼로그 또는 드래그 앤 드롭으로 로컬 Parquet 파일을 엽니다.
 - **원격 스토리지 연결** — S3 호환 오브젝트 스토리지(AWS S3 / MinIO 등)에 있는 Parquet 파일도 직접 조회합니다.
-- **결과 그리드** — 각 컬럼의 **이름과 타입**을 헤더에 표시하는 가상 스크롤 그리드로 결과를 렌더링합니다.
+- **Results grid** — A scrollable TanStack Table shows result column names and types. All returned rows are rendered; the current grid does not use virtualization.
 - **메타데이터 검사** — 스키마(Schema)와 Row Group 정보를 탭으로 확인할 수 있습니다.
 - **대용량 파일 대응** — DataFusion의 지연 읽기(projection / predicate pushdown)로 수백 MB~GB급 파일도 스캔합니다.
 
 ## 동작 방식 & 성능
 
-- 결과 그리드는 **최대 100행**으로 하드 캡이 걸려 있어, 파일 크기와 무관하게 렌더링 비용이 일정합니다.
-- 백엔드는 결과 스트림에서 **앞쪽 100행만 취한 뒤 중단**하며, 전체 결과 집합을 메모리에 적재하지 않습니다.
+- The backend retains and returns **at most 100 result rows**. The grid renders those rows; its cost also depends on the number of columns and cell contents.
+- The executor consumes a result stream without collecting the full result. It may inspect another batch to determine whether the result was truncated. This cap does not limit the engine's input scan, intermediate memory, or execution time: those depend on the query, data, and the user's local hardware. The app adds no automatic query timeout or fixed engine memory budget.
 - 쿼리는 `SELECT`만 허용됩니다 — 앱은 원본 파일을 **절대 변경하지 않습니다**.
 
 ## 기술 스택
@@ -30,7 +30,7 @@ Parquet 파일을 **SQL로 즉시 탐색**할 수 있는 Windows 데스크톱 GU
 | 쿼리 엔진 | [Apache DataFusion](https://datafusion.apache.org/) 54 (순수 Rust, 임베디드) |
 | 프런트엔드 | React 18 · TypeScript · Vite · Tailwind CSS |
 | 에디터 | CodeMirror (`@codemirror/lang-sql`) |
-| 결과 그리드 | TanStack Table · TanStack Virtual |
+| Results grid | TanStack Table (TanStack Virtual is installed but currently unused) |
 | 상태 관리 | Zustand |
 | 원격 스토리지 | `object_store` (S3 호환) |
 
@@ -38,8 +38,8 @@ Parquet 파일을 **SQL로 즉시 탐색**할 수 있는 Windows 데스크톱 GU
 
 ## 요구 사항 / 제약
 
-- **플랫폼**: Windows 전용 (v1은 Windows 데스크톱만 지원)
-- **빌드 도구**: Rust 툴체인(2024 edition), Node.js, Visual Studio C++ Build Tools(MSVC 링커)
+- **Platforms**: Windows and macOS; the release workflow builds Windows installers and a universal macOS DMG.
+- **Build tools**: Rust (2024 edition), Node.js, and platform tooling: Visual Studio C++ Build Tools on Windows or Xcode Command Line Tools on macOS.
 - **SQL 범위**: `SELECT` 전용 (읽기 전용)
 
 ## 개발 환경 실행

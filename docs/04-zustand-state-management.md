@@ -47,19 +47,21 @@ export const useAppStore = create<AppState>((set) => ({
   isLoading: false,           // 쿼리 전용 로딩 (파일 열기에 재사용하지 않음)
   queryError: null,
   rows: [],
+  resultSchema: [],           // Query result columns, separate from the file schema
   totalRows: 0,
   capped: false,
   sidebarCollapsed: false,
   fileMetadata: null,
   registrationStatus: "idle", // 파일 열기/등록 라이프사이클의 단일 진실 공급원
   registrationError: null,
-  openSeq: 0,                 // 단조 증가 "열기 토큰" (오래된 비동기 작업 무효화)
+  openSeq: 0,                 // Incremented by setFile/reset; not used by current hooks
   lastRemoteConnection: null, // 세션 한정 자동완성 메모리
 
   // ── 액션 ──
   setFile: (path, schema) => set((state) => ({ /* ... */ })),
   setQueryText: (sql) => set({ queryText: sql, queryError: null }),
-  setResults: (totalRows, capped, rows) => set({ rows, totalRows, capped, isLoading: false }),
+  setResults: (totalRows, capped, rows, resultSchema) =>
+    set({ rows, resultSchema, totalRows, capped, isLoading: false }),
   reset: () => set((state) => ({ /* 초기값으로 되돌림 */ })),
   // ...
 }));
@@ -87,15 +89,28 @@ type RegistrationStatus = "idle" | "registering" | "registered" | "error";
 ```
 
 - 차단 오버레이, 쿼리 실행 차단(gating), 등록 오류 표시를 모두 이 한 필드가 구동합니다.
-- `setFile`은 `openFile`이 성공한 뒤에만 호출되므로, 거기 도달했다는 것은 등록 성공을 의미합니다 →
-  `registrationStatus`를 `"registered"`로 set해 오버레이를 내립니다.
+- `useOpenFile` sets `registrationStatus` to `"registering"` before the first
+  await, including the native file dialog. It keeps that state through file
+  registration and the metadata request, then calls `setFile` to mark the
+  operation `"registered"`. Metadata errors are non-fatal. Dialog cancellation
+  restores the previous status; registration errors preserve the previous file.
 
-### `openSeq`: 단조 증가 "열기 토큰"
+### Preventing overlapping operations
 
-`setFile`과 `reset`은 `openSeq`를 1 증가시킵니다. 파일 열기 후 비동기 후속 작업(예:
-`getFileMetadata`)이 끝났을 때, 그 사이 더 새로운 열기가 일어났는지 이 토큰으로 감지합니다.
-같은 경로를 다시 여는 경우 `filePath` 동등 비교로는 구분할 수 없기 때문에, 이런 단조 토큰이
-필요합니다(오래된 응답이 새 상태를 덮어쓰는 race 방지).
+Both operation hooks read `useAppStore.getState()` when called, so even a
+callback retained from an older render sees the current state. File opens
+are ignored while a query is loading or registration is in progress.
+Queries are ignored unless registration is complete and no query is loading.
+Each operation sets its busy state synchronously before its first await.
+This also covers drag-and-drop and calls from different hook instances.
+
+`openSeq` still increments in `setFile` and `reset`, but the current hooks
+do not consume it. The active policy prevents overlapping operations rather
+than selecting a winning response after multiple opens have started.
+
+`schema` describes the opened file and drives the sidebar. `resultSchema`
+describes the query result and drives the grid, including aliases, aggregates,
+and zero-row results. `setFile` and `reset` clear the previous result schema.
 
 ### `lastRemoteConnection`은 의도적으로 reset/setFile에서 살아남는다
 
@@ -116,21 +131,15 @@ type RegistrationStatus = "idle" | "registering" | "registered" | "error";
 ## 5. 컴포넌트에서 스토어 소비하기 — selector 패턴
 
 컴포넌트는 필요한 조각만 selector로 골라야 불필요한 리렌더링을 피합니다. 여러 값을 한 번에 고를
-때는 `useShallow`로 얕은 비교를 적용합니다. 실제 예시(`src/hooks/useRunQuery.ts`):
+때는 `useShallow`로 얕은 비교를 적용합니다. Rendering example (`src/components/RunBar.tsx`):
 
 ```ts
 import { useShallow } from "zustand/react/shallow";
 import { useAppStore } from "../store/appStore";
 
-const {
-  queryText, isLoading, setLoading, setResults, setQueryError, registrationStatus,
-} = useAppStore(
+const { isLoading, registrationStatus } = useAppStore(
   useShallow((s) => ({
-    queryText: s.queryText,
     isLoading: s.isLoading,
-    setLoading: s.setLoading,
-    setResults: s.setResults,
-    setQueryError: s.setQueryError,
     registrationStatus: s.registrationStatus,
   }))
 );
@@ -146,20 +155,23 @@ const {
 
 ```ts
 const runQueryHandler = useCallback(async () => {
-  // gating: 파일이 등록되어 있고, 진행 중인 쿼리가 없을 때만 동작
+  const {
+    queryText, isLoading, registrationStatus, setLoading, setResults, setQueryError,
+  } = useAppStore.getState();
+  // Check the current operation state before starting work.
   if (isLoading || registrationStatus !== "registered") return;
 
   setLoading(true);                       // 상태: 로딩 시작
   try {
     const result = await runQuery(queryText); // IPC 왕복 (01번 문서 참고)
     setQueryError(null);                  // 상태: 이전 오류 제거
-    setResults(result.total_rows, result.capped, result.rows); // 상태: 결과 반영
+    setResults(result.total_rows, result.capped, result.rows, result.schema);
   } catch (err) {
     setQueryError(err instanceof Error ? err.message : String(err)); // 상태: 인라인 오류
   } finally {
     setLoading(false);                    // 성공/실패와 무관하게 항상 로딩 해제
   }
-}, [queryText, isLoading, registrationStatus, setLoading, setResults, setQueryError]);
+}, []);
 ```
 
 핵심 포인트:
@@ -167,8 +179,9 @@ const runQueryHandler = useCallback(async () => {
 - **Gating은 상태로 강제됩니다.** `registrationStatus !== "registered"`거나 이미 로딩 중이면
   핸들러가 no-op입니다. 이는 `Ctrl+Enter` 단축키가 비활성화된 버튼을 우회해 등록되지 않은
   테이블을 조회하는 것을 막습니다.
-- **`finally`로 로딩 누수를 차단합니다.** 결과 반영이나 디코딩이 던지더라도 `isLoading`이 항상
-  해제되므로, "로딩에서 멈춘" 상태가 구조적으로 발생하지 않습니다.
+- **Loading clears when the request settles.** `finally` clears `isLoading`
+  after success or failure, including decode errors. It does not impose a
+  timeout: a request that remains pending keeps the app busy.
 
 ## 7. 정리: 이 설계가 주는 것
 
@@ -176,5 +189,6 @@ const runQueryHandler = useCallback(async () => {
   파생됩니다.
 - **의도가 드러나는 상태 분리** — 쿼리 로딩(`isLoading`)과 파일 등록(`registrationStatus`)을
   나눠, 한 플래그를 과적재했을 때 생기는 간섭을 없앱니다.
-- **race에 강함** — `openSeq` 토큰으로 오래된 비동기 응답이 새 상태를 덮어쓰지 못하게 합니다.
+- **No overlapping opens or queries** — live state checks and synchronous
+  busy-state updates prevent a new operation from replacing an active one.
 - **선택적 구독** — selector + `useShallow`로 필요한 변화에만 리렌더링합니다.
