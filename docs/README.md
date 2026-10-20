@@ -8,7 +8,7 @@
 
 | # | 문서 | 다루는 내용 |
 |---|------|-------------|
-| 1 | [Tauri & IPC](./01-tauri-and-ipc.md) | Tauri v2 프로세스 모델, Rust 백엔드와 React 프론트엔드가 IPC로 통신하는 방식, 커맨드 표면, 이 앱의 2채널(JSON + 바이너리) 직렬화 전략 |
+| 1 | [Tauri & IPC](./01-tauri-and-ipc.md) | Tauri v2 process model, command surface, and one response frame containing JSON metadata and Arrow IPC rows |
 | 2 | [DataFusion & Arrow](./02-datafusion-and-arrow.md) | 인메모리 컬럼나 포맷 Apache Arrow, 임베디드 SQL 엔진 DataFusion, 100행 캡을 떠받치는 스트리밍 실행 모델, 단일 버전 의존성 규율 |
 | 3 | [Parquet 포맷](./03-parquet-format.md) | Parquet 디스크 컬럼나 포맷, footer/row group/column chunk 구조, pushdown 동작 원리, 이 앱이 footer만 읽어 메타데이터를 얻는 방법 |
 | 4 | [Zustand 상태 관리](./04-zustand-state-management.md) | Zustand 스토어가 프론트엔드의 단일 진실 공급원 역할을 하는 방식, selector 구독 패턴, 파일 열기/쿼리/결과 라이프사이클을 구동하는 상태 설계 |
@@ -31,6 +31,8 @@
                                                       └──────────────────────────┘
 ```
 
-Parquet 파일은 **`data`**라는 이름의 SQL 테이블로 등록됩니다. 사용자가 `SELECT`를 작성하면
-DataFusion이 계획을 세워 스트리밍 실행하고, 백엔드는 앞쪽 100행에서 멈춘 뒤 이를 Arrow IPC
-바이트로 직렬화하며, 프론트엔드가 이를 디코딩해 그리드에 그립니다.
+Parquet files are registered as the SQL table **`data`**. DataFusion executes
+read-only queries as a stream; the backend retains at most 100 result rows
+and returns one frame containing JSON metadata and Arrow IPC bytes. The
+frontend decodes that frame and renders a non-virtualized table using the
+query result schema. The row cap does not bound the engine's scan or resource use.

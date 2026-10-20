@@ -50,6 +50,8 @@ export interface SchemaField {
 /** Returned by `open_file` after the file is registered as table `data`. */
 export interface OpenFileResponse {
   schema: SchemaField[];
+  /** Non-fatal warning when the remote connection could not be saved securely. */
+  warning?: string;
 }
 
 /**
@@ -120,6 +122,11 @@ export interface RemoteConnection {
   object_key: string;
   access_key_id: string;
   secret_access_key: string;
+}
+
+/** Restores the last successful connection from the OS credential store. */
+export async function getLastRemoteConnection(): Promise<RemoteConnection | null> {
+  return invoke<RemoteConnection | null>("get_last_remote_connection");
 }
 
 /**

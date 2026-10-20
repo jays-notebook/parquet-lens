@@ -12,9 +12,8 @@
  *   D-04: Secret key field is type="password" by default; a reveal toggle switches
  *         it to type="text" (Eye / EyeOff icons from lucide-react).
  *   D-05: Form state is initialized from lastRemoteConnection in the Zustand store
- *         so values persist within the same session.
- *   D-06: The modal does NOT render its own error state — all errors route to the
- *         Phase 4 RegistrationOverlay.
+ *         backed by the OS credential store after a successful connection.
+ *   D-06: Open errors route to RegistrationOverlay; restore failures use a toast.
  *   D-07: Submit button is disabled while any of the 5 fields is empty.
  *
  * Source: 05-UI-SPEC.md §RemoteConnectionModal, §Layout Contract, §Copywriting Contract,
@@ -25,7 +24,7 @@ import { Eye, EyeOff } from "lucide-react";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 import { useAppStore } from "../store/appStore";
-import type { RemoteConnection } from "../lib/tauri";
+import { getLastRemoteConnection, type RemoteConnection } from "../lib/tauri";
 
 interface RemoteConnectionModalProps {
   open: boolean;
@@ -38,8 +37,31 @@ export function RemoteConnectionModal({
   onClose,
   onSubmit,
 }: RemoteConnectionModalProps) {
-  // D-05: autofill from last-used connection within the same session
+  // Autofill only from a successful connection.
   const lastRemoteConnection = useAppStore((s) => s.lastRemoteConnection);
+  const [restoring, setRestoring] = useState(false);
+
+  useEffect(() => {
+    setRestoring(false);
+    if (!open || useAppStore.getState().lastRemoteConnection) return;
+    let cancelled = false;
+    setRestoring(true);
+    void getLastRemoteConnection()
+      .then((conn) => {
+        if (!cancelled) useAppStore.getState().setLastRemoteConnection(conn);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          useAppStore.getState().setToast(
+            "Could not restore the saved remote connection. Enter connection details manually."
+          );
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setRestoring(false);
+      });
+    return () => { cancelled = true; };
+  }, [open]);
 
   // Form state — initialized from lastRemoteConnection so fields re-populate on re-open
   const [endpoint, setEndpoint] = useState(
@@ -60,6 +82,7 @@ export function RemoteConnectionModal({
   const [revealed, setRevealed] = useState(false);
 
   // Refs for focus management on open (accessibility — matches RegistrationOverlay pattern)
+  const dialogRef = useRef<HTMLDivElement>(null);
   const endpointRef = useRef<HTMLInputElement>(null);
   const bucketRef = useRef<HTMLInputElement>(null);
   const objectKeyRef = useRef<HTMLInputElement>(null);
@@ -83,6 +106,10 @@ export function RemoteConnectionModal({
   // Focus management: first empty field on open, or submit button if all autofilled
   useEffect(() => {
     if (!open) return;
+    if (restoring) {
+      dialogRef.current?.focus();
+      return;
+    }
 
     // Schedule focus after render so refs are attached
     const id = setTimeout(() => {
@@ -102,7 +129,7 @@ export function RemoteConnectionModal({
     }, 0);
 
     return () => clearTimeout(id);
-  }, [open, lastRemoteConnection]);
+  }, [open, lastRemoteConnection, restoring]);
 
   // D-07: disable submit while any field is empty
   const allFieldsFilled =
@@ -114,7 +141,7 @@ export function RemoteConnectionModal({
 
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (!allFieldsFilled) return;
+    if (restoring || !allFieldsFilled) return;
 
     const conn: RemoteConnection = {
       endpoint: endpoint.trim(),
@@ -161,7 +188,9 @@ export function RemoteConnectionModal({
     >
       {/* Modal card: var(--card), 400px wide, 24px padding */}
       <div
+        ref={dialogRef}
         role="dialog"
+        tabIndex={-1}
         aria-modal="true"
         aria-labelledby="remote-modal-title"
         style={{
@@ -188,10 +217,14 @@ export function RemoteConnectionModal({
         </span>
 
         {/* 5-field form — gap: 16px between field groups handled by card's column flex */}
-        <form
-          onSubmit={handleSubmit}
-          style={{ display: "flex", flexDirection: "column", gap: "12px" }}
-        >
+        <form onSubmit={handleSubmit} aria-busy={restoring}>
+          <fieldset
+            disabled={restoring}
+            style={{
+              border: 0, margin: 0, padding: 0, minWidth: 0,
+              display: "flex", flexDirection: "column", gap: "12px",
+            }}
+          >
           {/* Field 1: Endpoint URL */}
           <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
             <label
@@ -332,8 +365,9 @@ export function RemoteConnectionModal({
             disabled={!allFieldsFilled}
             style={{ width: "100%", minHeight: "44px" }}
           >
-            Open Remote File
+            {restoring ? "Restoring connection…" : "Open Remote File"}
           </Button>
+          </fieldset>
         </form>
       </div>
     </div>

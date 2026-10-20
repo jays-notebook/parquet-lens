@@ -41,6 +41,7 @@ tauri::Builder::default()
         commands::file::open_file,
         commands::file::get_file_metadata,
         commands::file::open_remote_file,
+        commands::remote_connection::get_last_remote_connection,
         commands::query::run_query,
         commands::query::get_last_result_meta,
         commands::query::get_page,
@@ -70,10 +71,13 @@ pub async fn run_query(
     sql: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<tauri::ipc::Response, String> {
-    guard_select_only(&sql)?;                 // SELECT가 아니면 거부 — 백엔드에서 실행됨
-    let mut engine = state.engine.lock().await;
-    let (_meta, ipc_bytes) = engine.execute(&sql).await?;
-    Ok(tauri::ipc::Response::new(ipc_bytes))
+    guard_select_only(&sql)?;
+    let (meta, ipc_bytes) = {
+        let mut engine = state.engine.lock().await;
+        engine.execute(&sql).await?
+    };
+    let frame = crate::ipc::frame::frame_meta_and_bytes(&meta, &ipc_bytes)?;
+    Ok(tauri::ipc::Response::new(frame))
 }
 ```
 
@@ -112,60 +116,55 @@ Rust 구조체를 `serde`로 **이름 변경 없이** 직렬화하므로, TypeSc
 | 커맨드 | 인자 | 반환 | 목적 |
 |--------|------|------|------|
 | `open_file` | `path` | `OpenFileResponse { schema }` | 로컬 Parquet 파일을 테이블 `data`로 등록 |
-| `open_remote_file` | `conn: RemoteConnection` | `OpenFileResponse { schema }` | 원격 S3/MinIO Parquet 객체를 `data`로 등록 |
+| `open_remote_file` | `conn: RemoteConnection` | `OpenFileResponse { schema, warning? }` | Registers a remote object and securely remembers the successful connection; an optional warning reports a storage failure |
+| `get_last_remote_connection` | — | `RemoteConnection \| null` | Restores the latest successful connection from the OS credential store |
 | `get_file_metadata` | – | `FileMetadata` | Parquet footer 통계(총 행 수 + row group별 정보) |
-| `run_query` | `sql` | `tauri::ipc::Response` (Arrow IPC 바이트) | SELECT 실행; 최대 100행을 바이너리로 반환 |
-| `get_last_result_meta` | – | `RunQueryResponse { total_rows, capped }` | 방금 반환한 행 데이터의 메타데이터 |
-| `get_page` | `offset, size` | `PageResponse { rows, offset, has_more }` | 캐시된 결과를 JSON 행으로 슬라이스 |
+| `run_query` | `sql` | `tauri::ipc::Response` containing a framed JSON header and Arrow IPC bytes | Executes a read-only query and returns its metadata and up to 100 rows together |
+| `get_last_result_meta` | – | `RunQueryResponse { total_rows, capped, schema }` | Secondary accessor for the latest cached result metadata; not called by the frontend query flow |
+| `get_page` | `offset, size` | `PageResponse { rows, offset, has_more }` | Slices the cached result of at most 100 rows; does not fetch additional rows from the source |
 
-## 5. 2채널 직렬화 전략
+## 5. Single-response framing
 
-이 앱에서 가장 중요한 IPC 설계 결정입니다.
+`run_query` makes **one IPC round trip**. Its binary response contains a JSON
+metadata segment and an Arrow IPC stream from the same execution:
 
-IPC가 데이터를 옮기는 방법은 두 가지입니다:
+```text
+[0..4)              metadata byte length (u32, little-endian)
+[4..4+meta_len)     UTF-8 JSON: { total_rows, capped, schema }
+[4+meta_len..)      Arrow IPC stream bytes
+```
 
-- **JSON 채널** — 기본값. 쉽고 타입 안전하지만 모든 것을 문자열화합니다. 작은 메타데이터에는
-  적합하지만, 대량 표 형식 데이터에는 낭비적이고 느립니다(숫자가 문자열이 되고 구조가 장황함).
-- **바이너리 채널** — `tauri::ipc::Response::new(bytes)`는 원시 바이트 페이로드를 반환하며,
-  프론트엔드에는 `ArrayBuffer`로 도착합니다. 문자열화가 없습니다.
-
-이 프로젝트가 따르는 규칙: **10KB 미만 메타데이터에만 JSON, 행 데이터는 Arrow IPC 바이트로
-바이너리 채널 사용.**
-
-따라서 `run_query`는 행을 JSON으로 반환하지 **않습니다**. Arrow IPC 바이트를 반환하고,
-프론트엔드는 `apache-arrow` 패키지의 `tableFromIPC()`로 디코딩합니다. Tauri 커맨드는 단일 값을
-반환하므로, 메타데이터(`total_rows`, `capped`)는 **두 번째 호출**로 가져옵니다:
+The backend builds this frame in `src-tauri/src/ipc/frame.rs`. The frontend
+validates the length prefix, parses the metadata, and decodes the remaining
+bytes in `decodeQueryFrame`:
 
 ```ts
 // src/lib/tauri.ts — runQuery()
-const ipcBuffer = await invoke<ArrayBuffer>("run_query", { sql }); // 1. 바이너리: 행 데이터
-const meta       = await invoke<RunQueryResponse>("get_last_result_meta"); // 2. JSON: 메타데이터
-const table      = tableFromIPC(ipcBuffer);
-const rows       = arrowTableToRows(table);  // 컬럼나 → 행 객체로 변환(그리드용)
+const frame = await invoke<ArrayBuffer>("run_query", { sql });
+return decodeQueryFrame(frame);
 ```
 
-백엔드는 마지막 쿼리의 메타데이터를 엔진(`last_query_meta`)에 캐시하므로, 두 번째 호출은 재실행이
-아니라 저렴한 조회입니다.
+The metadata schema describes the **query result**, including aliases and
+aggregates, rather than the opened file. A zero-row result has an empty Arrow
+payload but still includes its result schema in the JSON segment. Metadata
+size depends on the columns; there is no enforced 10 KB metadata limit.
 
-> `get_page`는 예외적으로 JSON 행을 반환합니다 — 이미 캡(≤100행)이 적용된 캐시에 대한
-> 폴백/페이징 경로라서 페이로드가 항상 작습니다.
+Returning both parts together prevents interleaved commands from pairing one
+query's rows with another query's metadata. `get_last_result_meta` remains a
+secondary cache accessor; it is not a second step in `runQuery`.
+
+`get_page` returns JSON rows from the already retained cache. Neither it nor
+the current grid retrieves rows beyond the 100-row cap.
 
 ## 6. 엔드 투 엔드 왕복(쿼리 실행)
 
 ```
- React (RunBar)
-   │  runQuery(sql)
-   ▼
- src/lib/tauri.ts ── invoke("run_query", {sql}) ─────────────► run_query  (commands/query.rs)
-                                                                  │  guard_select_only(sql)   ← SELECT 전용, 백엔드 강제
-                                                                  │  engine.execute(sql)      ← 스트림, 100행에서 정지
-                                                                  │  record_batches_to_ipc()  ← Arrow IPC 바이트
-                  ◄──────────── tauri::ipc::Response (바이너리) ───┘
-   │
-   │  invoke("get_last_result_meta") ──────────────────────────► get_last_result_meta
-   │              ◄──────────────── RunQueryResponse (JSON) ──────┘
-   ▼
- tableFromIPC(buffer) → arrowTableToRows() → TanStack Table 그리드
+Run button / editor shortcut → useRunQuery → runQuery(sql)
+  → invoke("run_query", { sql })
+  → guard_select_only → engine.execute → frame_meta_and_bytes
+  ← one binary response: [length | JSON metadata | Arrow IPC]
+  → decodeQueryFrame → tableFromIPC → arrowTableToRows
+  → setResults(rows and result schema) → TanStack Table
 ```
 
 `execute`와 `record_batches_to_ipc`의 컬럼나/Arrow 세부 사항은

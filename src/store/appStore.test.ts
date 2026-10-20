@@ -197,9 +197,9 @@ describe("isLoading is unchanged (not overloaded for open path)", () => {
 /**
  * Wave 0 tests for D-05 in-session autofill memory (Phase 5).
  *
- * `lastRemoteConnection` is session-scoped — it survives reset() and setFile()
+ * The in-memory `lastRemoteConnection` survives reset() and setFile()
  * so the connection form can re-populate on re-open without losing the user's
- * last entered values. It is NOT file state; clearing on reset would break
+ * last successful values. It is NOT file state; clearing on reset would break
  * the autofill invariant (RESEARCH.md §Pattern 5 anti-pattern).
  */
 describe("lastRemoteConnection (D-05 autofill)", () => {

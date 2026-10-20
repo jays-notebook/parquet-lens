@@ -35,6 +35,9 @@ pub struct SchemaField {
 #[derive(Debug, Serialize)]
 pub struct OpenFileResponse {
     pub schema: Vec<SchemaField>,
+    /// Non-fatal warning when a successful remote connection could not be saved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 /// Returned by `run_query` after SQL execution (Plan 02).

@@ -22,6 +22,7 @@ interface ToolbarProps {
 
 export function Toolbar({ onOpenRemote }: ToolbarProps) {
   const filePath = useAppStore((s) => s.filePath);
+  const busy = useAppStore((s) => s.isLoading || s.registrationStatus === "registering");
   // Shared open pipeline (WR-02) — dialog path resolves then registers.
   const { openViaDialog } = useOpenFile();
 
@@ -63,6 +64,7 @@ export function Toolbar({ onOpenRemote }: ToolbarProps) {
           variant="ghost"
           size="sm"
           onClick={() => void openViaDialog()}
+          disabled={busy}
           style={{ color: "var(--foreground)" }}
         >
           Open File
@@ -71,6 +73,7 @@ export function Toolbar({ onOpenRemote }: ToolbarProps) {
           variant="ghost"
           size="sm"
           onClick={onOpenRemote}
+          disabled={busy}
           style={{ color: "var(--foreground)" }}
         >
           Open Remote
