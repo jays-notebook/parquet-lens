@@ -115,13 +115,49 @@ export async function openFile(path: string): Promise<OpenFileResponse> {
  * in `RemoteConnection` on the backend (Tauri serializes without renaming).
  * See: src-tauri/src/commands/file.rs `RemoteConnection` struct.
  */
-export interface RemoteConnection {
+export interface RemoteCredentials {
   endpoint: string;
+  access_key_id: string;
+  secret_access_key: string;
+}
+
+export interface RemoteConnection extends RemoteCredentials {
   bucket: string;
   /** Path to the Parquet object within the bucket, e.g. "prefix/file.parquet". */
   object_key: string;
-  access_key_id: string;
-  secret_access_key: string;
+}
+
+export interface BucketPage {
+  buckets: string[];
+  next_token: string | null;
+}
+
+export interface RemoteObject {
+  key: string;
+  size: number;
+  last_modified: string;
+}
+
+export interface PrefixPage {
+  prefixes: string[];
+  objects: RemoteObject[];
+  next_token: string | null;
+}
+
+export function listRemoteBuckets(
+  credentials: RemoteCredentials,
+  pageToken: string | null = null,
+): Promise<BucketPage> {
+  return invoke<BucketPage>("list_remote_buckets", { credentials, pageToken });
+}
+
+export function listRemotePrefix(
+  credentials: RemoteCredentials,
+  bucket: string,
+  prefix: string,
+  pageToken: string | null = null,
+): Promise<PrefixPage> {
+  return invoke<PrefixPage>("list_remote_prefix", { credentials, bucket, prefix, pageToken });
 }
 
 /** Restores the last successful connection from the OS credential store. */

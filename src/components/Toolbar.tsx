@@ -18,10 +18,12 @@ function basename(path: string): string {
 interface ToolbarProps {
   /** Called when the user clicks the "Open Remote" button (REMOTE-01). */
   onOpenRemote: () => void;
+  onBrowseRemote: () => void;
 }
 
-export function Toolbar({ onOpenRemote }: ToolbarProps) {
+export function Toolbar({ onOpenRemote, onBrowseRemote }: ToolbarProps) {
   const filePath = useAppStore((s) => s.filePath);
+  const hasRemoteConnection = useAppStore((s) => s.activeRemoteConnection !== null);
   const busy = useAppStore((s) => s.isLoading || s.registrationStatus === "registering");
   // Shared open pipeline (WR-02) — dialog path resolves then registers.
   const { openViaDialog } = useOpenFile();
@@ -51,14 +53,15 @@ export function Toolbar({ onOpenRemote }: ToolbarProps) {
           overflow: "hidden",
           textOverflow: "ellipsis",
           whiteSpace: "nowrap",
-          maxWidth: "calc(100% - 120px)",
+          minWidth: 0,
+          marginRight: "8px",
         }}
         title={filePath ?? ""}
       >
         {filename}
       </span>
 
-      {/* Right region: Open File + Open Remote ghost buttons (REMOTE-01 / D-02) */}
+      {/* File actions */}
       <div style={{ display: "flex", gap: "8px", flexShrink: 0 }}>
         <Button
           variant="ghost"
@@ -77,6 +80,16 @@ export function Toolbar({ onOpenRemote }: ToolbarProps) {
           style={{ color: "var(--foreground)" }}
         >
           Open Remote
+        </Button>
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={onBrowseRemote}
+          disabled={busy || !hasRemoteConnection}
+          title={hasRemoteConnection ? "Browse using the current remote connection" : "Open a remote file to browse its storage"}
+          style={{ color: "var(--foreground)" }}
+        >
+          Browse
         </Button>
       </div>
     </div>

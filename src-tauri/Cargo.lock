@@ -3708,12 +3708,14 @@ dependencies = [
  "futures",
  "keyring",
  "object_store",
+ "quick-xml",
  "serde",
  "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
  "tokio",
+ "url",
 ]
 
 [[package]]

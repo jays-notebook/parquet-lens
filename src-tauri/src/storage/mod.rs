@@ -14,6 +14,7 @@ use object_store::ObjectStore;
 
 pub mod local;
 pub mod remote;
+pub mod browser;
 
 pub use local::LocalFileSource;
 pub use remote::RemoteS3Source;

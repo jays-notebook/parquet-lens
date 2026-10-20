@@ -114,8 +114,7 @@ pub async fn get_file_metadata(
 /// and returns the inferred Arrow schema.
 ///
 /// Mirrors `open_file` exactly — constructs a `RemoteS3Source` instead of `LocalFileSource`,
-/// then delegates to the unchanged `engine.register_source`. The engine is completely
-/// storage-agnostic (SPEC constraint: `engine/context.rs` must NOT be modified).
+/// then delegates to `engine.register_source`. The engine remains storage-agnostic.
 ///
 /// All errors propagate as `Err(String)` prefixed `"Failed to open remote object: <cause>"`.
 /// Credentials are never logged or included in error messages (T-05-01).
@@ -137,7 +136,7 @@ pub async fn open_remote_file(
     // Wrap the engine's storage-agnostic errors (e.g. "Failed to infer table config: …")
     // with the remote prefix so every remote-open failure reads
     // "Failed to open remote object: <cause>" per REMOTE-02 / D-06. The engine layer is
-    // storage-agnostic (engine/context.rs must NOT be modified), so the remote framing
+    // storage-agnostic, so the remote framing
     // lives here at the command boundary. The raw object_store cause carries no
     // credential (T-05-01).
     engine
