@@ -23,6 +23,7 @@ interface AppState {
   // File state
   filePath: string | null;
   schema: SchemaField[];
+  activeRemoteConnection: RemoteConnection | null;
 
   // Query state
   queryText: string;
@@ -84,7 +85,7 @@ interface AppState {
   setLastRemoteConnection: (conn: RemoteConnection | null) => void;
 
   // Actions
-  setFile: (path: string, schema: SchemaField[]) => void;
+  setFile: (path: string, schema: SchemaField[], remoteConnection?: RemoteConnection | null) => void;
   setQueryText: (sql: string) => void;
   setLoading: (loading: boolean) => void;
   /**
@@ -123,6 +124,7 @@ export const useAppStore = create<AppState>((set) => ({
   // Initial state
   filePath: null,
   schema: [],
+  activeRemoteConnection: null,
   queryText: DEFAULT_QUERY,
   isLoading: false,
   queryError: null,
@@ -140,10 +142,11 @@ export const useAppStore = create<AppState>((set) => ({
   lastRemoteConnection: null,
 
   // Actions
-  setFile: (path, schema) =>
+  setFile: (path, schema, remoteConnection = null) =>
     set((state) => ({
       filePath: path,
       schema,
+      activeRemoteConnection: remoteConnection,
       queryText: DEFAULT_QUERY,
       rows: [],
       resultSchema: [], // the previous file's result columns must not outlive it
@@ -195,6 +198,7 @@ export const useAppStore = create<AppState>((set) => ({
     set((state) => ({
       filePath: null,
       schema: [],
+      activeRemoteConnection: null,
       queryText: DEFAULT_QUERY,
       isLoading: false,
       queryError: null, // D-04: reset clears all transient error state

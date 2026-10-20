@@ -23,6 +23,37 @@ use object_store::ObjectStore;
 
 use super::DataSource;
 
+pub(super) const REGION: &str = "us-east-1";
+
+pub(super) fn client_options() -> ClientOptions {
+    // Internal MinIO compatibility, shared by browsing and file reads.
+    ClientOptions::new()
+        .with_allow_invalid_certificates(true)
+        .with_allow_http(true)
+}
+
+pub(super) fn build_store(
+    endpoint: &str,
+    bucket: &str,
+    access_key_id: &str,
+    secret_access_key: &str,
+) -> Result<AmazonS3, String> {
+    if bucket.trim().is_empty() {
+        return Err("Bucket name must not be empty".into());
+    }
+    ObjectStoreUrl::parse(format!("s3://{bucket}"))
+        .map_err(|_| "Invalid bucket name: must be a valid S3 bucket identifier".to_string())?;
+    AmazonS3Builder::new()
+        .with_endpoint(endpoint.trim_end_matches('/'))
+        .with_bucket_name(bucket)
+        .with_access_key_id(access_key_id)
+        .with_secret_access_key(secret_access_key)
+        .with_region(REGION)
+        .with_client_options(client_options())
+        .build()
+        .map_err(|_| "Could not configure remote storage. Check the connection details.".into())
+}
+
 /// A remote Parquet object on an S3-compatible endpoint, ready to be registered with DataFusion.
 ///
 /// Credentials are not kept as separate struct fields, but they are NOT discarded after
@@ -75,35 +106,7 @@ impl RemoteS3Source {
         ObjectStoreUrl::parse(format!("s3://{}", bucket))
             .map_err(|_| "Invalid bucket name: must be a valid S3 bucket identifier".to_string())?;
 
-        let client_options = ClientOptions::new()
-            // SPEC-locked v2 tradeoff: accept self-signed / invalid TLS certificates so
-            // internal MinIO deployments over HTTPS with self-signed certs work out of the box.
-            // Do NOT apply this setting in non-internal contexts where TLS integrity matters.
-            .with_allow_invalid_certificates(true)
-            // Allow plain http:// endpoints (internal MinIO is often HTTP-only).
-            // CRITICAL: allow_http MUST be set on the ClientOptions, not via
-            // AmazonS3Builder::with_allow_http, because with_client_options(...) below
-            // REPLACES the builder's entire ClientOptions. Setting it on the builder and
-            // then calling with_client_options silently resets allow_http back to false,
-            // which makes reqwest reject every http:// URL with a `BadScheme`
-            // ("URL scheme is not allowed") builder error before any network call.
-            .with_allow_http(true);
-
-        let store = AmazonS3Builder::new()
-            .with_endpoint(endpoint)
-            .with_bucket_name(bucket)
-            .with_access_key_id(access_key_id)
-            .with_secret_access_key(secret_access_key)
-            // MinIO ignores the region value; "us-east-1" is the required placeholder
-            // (AmazonS3Builder requires a region to be set — RESEARCH §Pattern 1)
-            .with_region("us-east-1")
-            // NOTE: with_virtual_hosted_style_request is NOT called — the default is
-            // false (path-style), which is exactly what MinIO requires for custom endpoints.
-            // Calling it with true would break MinIO path-style addressing (RESEARCH §Pitfall 2).
-            // allow_http is carried on `client_options` above (see the CRITICAL note there).
-            .with_client_options(client_options)
-            .build()
-            .map_err(|e| format!("Failed to open remote object: {}", e))?;
+        let store = build_store(endpoint, bucket, access_key_id, secret_access_key)?;
 
         Ok(Self {
             bucket: bucket.to_string(),
@@ -138,7 +141,14 @@ impl DataSource for RemoteS3Source {
     /// The URL is `s3://{bucket}/{object_key}` with no trailing slash — single-file semantics,
     /// not a prefix scan (RESEARCH §Pattern 1).
     fn table_path(&self) -> Result<ListingTableUrl, String> {
-        ListingTableUrl::parse(format!("s3://{}/{}", self.bucket, self.object_key))
+        let mut url = url::Url::parse(&format!("s3://{}", self.bucket))
+            .map_err(|_| "Invalid bucket name".to_string())?;
+        // A key is literal data, not a URL: escape %, # and ? as well as Unicode.
+        url.path_segments_mut()
+            .map_err(|_| "Invalid remote path".to_string())?
+            .clear()
+            .extend(self.object_key.split('/'));
+        ListingTableUrl::parse(url.as_str())
             .map_err(|e| format!("Failed to parse remote path as ListingTableUrl: {}", e))
     }
 }

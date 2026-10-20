@@ -64,6 +64,7 @@ afterEach(() => vi.restoreAllMocks());
 it("remembers a remote connection only after a successful open", async () => {
   const previous = { ...conn, endpoint: "https://previous.example.com" };
   useAppStore.getState().setLastRemoteConnection(previous);
+  useAppStore.getState().setFile("previous.parquet", schema, previous);
   let release!: () => void;
   vi.mocked(openRemoteFile).mockImplementationOnce(async () => {
     await new Promise<void>((resolve) => { release = resolve; });
@@ -72,21 +73,36 @@ it("remembers a remote connection only after a successful open", async () => {
   const pending = handlers().openRemote(conn);
   try {
     expect(useAppStore.getState().lastRemoteConnection).toEqual(previous);
+    expect(useAppStore.getState().activeRemoteConnection).toEqual(previous);
   } finally {
     release();
     await pending;
   }
   expect(useAppStore.getState().lastRemoteConnection).toEqual(conn);
+  expect(useAppStore.getState().activeRemoteConnection).toEqual(conn);
 });
 
 it("keeps the last successful connection when another remote open fails", async () => {
   vi.spyOn(console, "error").mockImplementation(() => {});
   const previous = { ...conn, endpoint: "https://previous.example.com" };
   useAppStore.getState().setLastRemoteConnection(previous);
+  useAppStore.getState().setFile("previous.parquet", schema, previous);
   vi.mocked(openRemoteFile).mockRejectedValueOnce(new Error("Access denied"));
   await handlers().openRemote(conn);
   expect(useAppStore.getState().lastRemoteConnection).toEqual(previous);
+  expect(useAppStore.getState().activeRemoteConnection).toEqual(previous);
   expect(useAppStore.getState().registrationStatus).toBe("error");
+});
+
+it.each(["local", "dialog", "reset"] as const)("clears the active remote connection after %s, retaining saved credentials", async (operation) => {
+  const actions = handlers();
+  await actions.openRemote(conn);
+  expect(useAppStore.getState().activeRemoteConnection).toEqual(conn);
+  if (operation === "local") await actions.openPath("local.parquet");
+  else if (operation === "dialog") await actions.openViaDialog();
+  else useAppStore.getState().reset();
+  expect(useAppStore.getState().activeRemoteConnection).toBeNull();
+  expect(useAppStore.getState().lastRemoteConnection).toEqual(conn);
 });
 
 it("keeps a successful open usable and reports a credential storage warning", async () => {

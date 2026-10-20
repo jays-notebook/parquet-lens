@@ -45,7 +45,7 @@ export function useOpenFile() {
       } catch (err) {
         console.warn("[useOpenFile] getFileMetadata failed (non-fatal):", err);
       }
-      setFile(displayPath, res.schema);
+      setFile(displayPath, res.schema, typeof source === "string" ? null : source);
       setFileMetadata(metadata);
       if (res.warning) setToast(res.warning);
     } catch (err) {

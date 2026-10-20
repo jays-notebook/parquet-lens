@@ -42,6 +42,8 @@ tauri::Builder::default()
         commands::file::get_file_metadata,
         commands::file::open_remote_file,
         commands::remote_connection::get_last_remote_connection,
+        commands::remote_browser::list_remote_buckets,
+        commands::remote_browser::list_remote_prefix,
         commands::query::run_query,
         commands::query::get_last_result_meta,
         commands::query::get_page,
@@ -118,6 +120,8 @@ Rust 구조체를 `serde`로 **이름 변경 없이** 직렬화하므로, TypeSc
 | `open_file` | `path` | `OpenFileResponse { schema }` | 로컬 Parquet 파일을 테이블 `data`로 등록 |
 | `open_remote_file` | `conn: RemoteConnection` | `OpenFileResponse { schema, warning? }` | Registers a remote object and securely remembers the successful connection; an optional warning reports a storage failure |
 | `get_last_remote_connection` | — | `RemoteConnection \| null` | Restores the latest successful connection from the OS credential store |
+| `list_remote_buckets` | `credentials: RemoteCredentials, pageToken?` | `BucketPage { buckets, next_token }` | Read-only bucket enumeration; the UI filters loaded results and offers more pages or manual entry |
+| `list_remote_prefix` | `credentials, bucket, prefix, pageToken?` | `PrefixPage { prefixes, objects, next_token }` | Lists one folder level with a 200-entry page size; object entries contain `key`, `size`, and `last_modified` |
 | `get_file_metadata` | – | `FileMetadata` | Parquet footer 통계(총 행 수 + row group별 정보) |
 | `run_query` | `sql` | `tauri::ipc::Response` containing a framed JSON header and Arrow IPC bytes | Executes a read-only query and returns its metadata and up to 100 rows together |
 | `get_last_result_meta` | – | `RunQueryResponse { total_rows, capped, schema }` | Secondary accessor for the latest cached result metadata; not called by the frontend query flow |

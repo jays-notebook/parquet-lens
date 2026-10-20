@@ -1,374 +1,180 @@
-/**
- * Remote connection modal for opening MinIO/S3-compatible Parquet objects.
- *
- * 5-field centered modal form. Props:
- *   open     — whether the modal is visible
- *   onClose  — called to dismiss the modal (Escape key, backdrop click)
- *   onSubmit — called AFTER onClose() with the filled RemoteConnection (D-03)
- *
- * Key design decisions (from 05-CONTEXT.md / 05-UI-SPEC.md):
- *   D-03: onClose() fires BEFORE onSubmit() so the modal is never visible while
- *         the Phase 4 RegistrationOverlay is active — no stacked overlays.
- *   D-04: Secret key field is type="password" by default; a reveal toggle switches
- *         it to type="text" (Eye / EyeOff icons from lucide-react).
- *   D-05: Form state is initialized from lastRemoteConnection in the Zustand store
- *         backed by the OS credential store after a successful connection.
- *   D-06: Open errors route to RegistrationOverlay; restore failures use a toast.
- *   D-07: Submit button is disabled while any of the 5 fields is empty.
- *
- * Source: 05-UI-SPEC.md §RemoteConnectionModal, §Layout Contract, §Copywriting Contract,
- *         §Accessibility Contract; 05-PATTERNS.md §RemoteConnectionModal.tsx
- */
-import { useState, useEffect, useRef } from "react";
-import { Eye, EyeOff } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { Eye, EyeOff, X } from "lucide-react";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
+import { RemoteBrowser, parentPrefix } from "./RemoteBrowser";
 import { useAppStore } from "../store/appStore";
-import { getLastRemoteConnection, type RemoteConnection } from "../lib/tauri";
+import { getLastRemoteConnection, type RemoteConnection, type RemoteCredentials } from "../lib/tauri";
+import "./remote-browser.css";
 
 interface RemoteConnectionModalProps {
   open: boolean;
   onClose: () => void;
   onSubmit: (conn: RemoteConnection) => void | Promise<void>;
+  browseConnection?: RemoteConnection | null;
 }
 
-export function RemoteConnectionModal({
-  open,
-  onClose,
-  onSubmit,
-}: RemoteConnectionModalProps) {
-  // Autofill only from a successful connection.
-  const lastRemoteConnection = useAppStore((s) => s.lastRemoteConnection);
+const emptyConnection: RemoteConnection = {
+  endpoint: "", access_key_id: "", secret_access_key: "", bucket: "", object_key: "",
+};
+
+export function RemoteConnectionModal({ open, onClose, onSubmit, browseConnection }: RemoteConnectionModalProps) {
+  const [draft, setDraft] = useState<RemoteConnection>(emptyConnection);
+  const [credentials, setCredentials] = useState<RemoteCredentials | null>(null);
+  const [step, setStep] = useState<"connection" | "browse" | "direct">("connection");
   const [restoring, setRestoring] = useState(false);
-
-  useEffect(() => {
-    setRestoring(false);
-    if (!open || useAppStore.getState().lastRemoteConnection) return;
-    let cancelled = false;
-    setRestoring(true);
-    void getLastRemoteConnection()
-      .then((conn) => {
-        if (!cancelled) useAppStore.getState().setLastRemoteConnection(conn);
-      })
-      .catch(() => {
-        if (!cancelled) {
-          useAppStore.getState().setToast(
-            "Could not restore the saved remote connection. Enter connection details manually."
-          );
-        }
-      })
-      .finally(() => {
-        if (!cancelled) setRestoring(false);
-      });
-    return () => { cancelled = true; };
-  }, [open]);
-
-  // Form state — initialized from lastRemoteConnection so fields re-populate on re-open
-  const [endpoint, setEndpoint] = useState(
-    lastRemoteConnection?.endpoint ?? ""
-  );
-  const [bucket, setBucket] = useState(lastRemoteConnection?.bucket ?? "");
-  const [objectKey, setObjectKey] = useState(
-    lastRemoteConnection?.object_key ?? ""
-  );
-  const [accessKeyId, setAccessKeyId] = useState(
-    lastRemoteConnection?.access_key_id ?? ""
-  );
-  const [secretAccessKey, setSecretAccessKey] = useState(
-    lastRemoteConnection?.secret_access_key ?? ""
-  );
-
-  // D-04: secret key reveal toggle
   const [revealed, setRevealed] = useState(false);
-
-  // Refs for focus management on open (accessibility — matches RegistrationOverlay pattern)
   const dialogRef = useRef<HTMLDivElement>(null);
   const endpointRef = useRef<HTMLInputElement>(null);
-  const bucketRef = useRef<HTMLInputElement>(null);
-  const objectKeyRef = useRef<HTMLInputElement>(null);
-  const accessKeyIdRef = useRef<HTMLInputElement>(null);
-  const secretAccessKeyRef = useRef<HTMLInputElement>(null);
-  const submitButtonRef = useRef<HTMLButtonElement>(null);
+  const primaryRef = useRef<HTMLButtonElement>(null);
 
-  // Re-populate form state when lastRemoteConnection changes (e.g. after a successful open)
-  // and reset the reveal toggle on each open
-  useEffect(() => {
-    if (open) {
-      setEndpoint(lastRemoteConnection?.endpoint ?? "");
-      setBucket(lastRemoteConnection?.bucket ?? "");
-      setObjectKey(lastRemoteConnection?.object_key ?? "");
-      setAccessKeyId(lastRemoteConnection?.access_key_id ?? "");
-      setSecretAccessKey(lastRemoteConnection?.secret_access_key ?? "");
-      setRevealed(false);
-    }
-  }, [open, lastRemoteConnection]);
-
-  // Focus management: first empty field on open, or submit button if all autofilled
   useEffect(() => {
     if (!open) return;
-    if (restoring) {
-      dialogRef.current?.focus();
-      return;
+    let cancelled = false;
+    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    setStep(browseConnection ? "browse" : "connection");
+    setCredentials(browseConnection ? {
+      endpoint: browseConnection.endpoint,
+      access_key_id: browseConnection.access_key_id,
+      secret_access_key: browseConnection.secret_access_key,
+    } : null);
+    setRevealed(false);
+    const previous = browseConnection ?? useAppStore.getState().lastRemoteConnection;
+    setDraft(previous ?? emptyConnection);
+    setRestoring(!previous);
+    if (!previous) {
+      void getLastRemoteConnection().then((connection) => {
+        if (cancelled) return;
+        useAppStore.getState().setLastRemoteConnection(connection);
+        setDraft(connection ?? emptyConnection);
+      }).catch(() => {
+        if (!cancelled) useAppStore.getState().setToast("Could not restore the saved remote connection. Enter connection details manually.");
+      }).finally(() => {
+        if (!cancelled) setRestoring(false);
+      });
     }
-
-    // Schedule focus after render so refs are attached
-    const id = setTimeout(() => {
-      const refs = [
-        { ref: endpointRef, value: lastRemoteConnection?.endpoint ?? "" },
-        { ref: bucketRef, value: lastRemoteConnection?.bucket ?? "" },
-        { ref: objectKeyRef, value: lastRemoteConnection?.object_key ?? "" },
-        { ref: accessKeyIdRef, value: lastRemoteConnection?.access_key_id ?? "" },
-        { ref: secretAccessKeyRef, value: lastRemoteConnection?.secret_access_key ?? "" },
-      ];
-      const firstEmpty = refs.find((r) => r.value === "");
-      if (firstEmpty) {
-        firstEmpty.ref.current?.focus();
-      } else {
-        submitButtonRef.current?.focus();
-      }
-    }, 0);
-
-    return () => clearTimeout(id);
-  }, [open, lastRemoteConnection, restoring]);
-
-  // D-07: disable submit while any field is empty
-  const allFieldsFilled =
-    endpoint.trim() !== "" &&
-    bucket.trim() !== "" &&
-    objectKey.trim() !== "" &&
-    accessKeyId.trim() !== "" &&
-    secretAccessKey.trim() !== "";
-
-  function handleSubmit(e: React.FormEvent) {
-    e.preventDefault();
-    if (restoring || !allFieldsFilled) return;
-
-    const conn: RemoteConnection = {
-      endpoint: endpoint.trim(),
-      bucket: bucket.trim(),
-      object_key: objectKey.trim(),
-      access_key_id: accessKeyId.trim(),
-      secret_access_key: secretAccessKey,
+    return () => {
+      cancelled = true;
+      previousFocus?.focus();
     };
+  }, [open, browseConnection]);
 
-    // D-03: close modal FIRST, then hand off to openRemote so the Phase 4
-    // RegistrationOverlay is the only visible overlay during registration.
-    onClose();
-    void onSubmit(conn);
+  useEffect(() => {
+    if (!open) return;
+    if (restoring) dialogRef.current?.focus();
+    else if (step === "connection") {
+      if (!endpointRef.current?.value) endpointRef.current?.focus();
+      else primaryRef.current?.focus();
+    } else {
+      dialogRef.current?.querySelector<HTMLInputElement>("input")?.focus();
+    }
+  }, [open, restoring, step]);
+
+  const canConnect = !!(draft.endpoint.trim() && draft.access_key_id.trim() && draft.secret_access_key.trim());
+  function begin(nextStep: "browse" | "direct") {
+    if (restoring || !canConnect) return;
+    setCredentials({
+      endpoint: draft.endpoint.trim(), access_key_id: draft.access_key_id.trim(), secret_access_key: draft.secret_access_key,
+    });
+    setRevealed(false);
+    setStep(nextStep);
   }
 
-  // Escape key closes the modal (accessibility)
-  function handleKeyDown(e: React.KeyboardEvent) {
-    if (e.key === "Escape") {
+  function openObject(bucket: string, key: string) {
+    if (!credentials || !bucket.trim() || !key.trim()) return;
+    // Close before registration so there is only one blocking overlay.
+    onClose();
+    void onSubmit({ ...credentials, bucket: bucket.trim(), object_key: key });
+  }
+
+  function handleKeyDown(event: React.KeyboardEvent) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
       onClose();
     }
+    if (event.key !== "Tab") return;
+    const elements = [...(dialogRef.current?.querySelectorAll<HTMLElement>(
+      'button:not(:disabled), input:not(:disabled), [tabindex="0"]'
+    ) ?? [])].filter((element) => !element.closest("fieldset:disabled"));
+    const first = elements[0];
+    const last = elements[elements.length - 1];
+    if (!first) { event.preventDefault(); dialogRef.current?.focus(); }
+    else if (event.shiftKey && (document.activeElement === first || document.activeElement === dialogRef.current)) {
+      event.preventDefault(); last.focus();
+    } else if (!event.shiftKey && (document.activeElement === last || document.activeElement === dialogRef.current)) {
+      event.preventDefault(); first.focus();
+    }
   }
 
-  // Return null when closed — no DOM node, no layout cost
   if (!open) return null;
 
   return (
-    <div
-      // Backdrop: fixed inset-0, rgba(0,0,0,0.65), zIndex 70 (above RegistrationOverlay at 60)
-      style={{
-        position: "fixed",
-        inset: 0,
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        backgroundColor: "rgba(0, 0, 0, 0.65)",
-        zIndex: 70,
-        pointerEvents: "all",
-      }}
-      onKeyDown={handleKeyDown}
-      // Clicking the backdrop closes the modal
-      onClick={(e) => {
-        if (e.target === e.currentTarget) onClose();
-      }}
-    >
-      {/* Modal card: var(--card), 400px wide, 24px padding */}
-      <div
-        ref={dialogRef}
-        role="dialog"
-        tabIndex={-1}
-        aria-modal="true"
-        aria-labelledby="remote-modal-title"
-        style={{
-          backgroundColor: "var(--card)",
-          width: "400px",
-          borderRadius: "var(--radius)",
-          padding: "24px",
-          display: "flex",
-          flexDirection: "column",
-          gap: "16px",
-        }}
-      >
-        {/* Title: 16px / 600 weight (UI-SPEC.md §Typography heading role) */}
-        <span
-          id="remote-modal-title"
-          style={{
-            fontSize: "16px",
-            fontWeight: 600,
-            color: "var(--foreground)",
-            lineHeight: 1.2,
-          }}
-        >
-          Open Remote Parquet File
-        </span>
-
-        {/* 5-field form — gap: 16px between field groups handled by card's column flex */}
-        <form onSubmit={handleSubmit} aria-busy={restoring}>
-          <fieldset
-            disabled={restoring}
-            style={{
-              border: 0, margin: 0, padding: 0, minWidth: 0,
-              display: "flex", flexDirection: "column", gap: "12px",
-            }}
-          >
-          {/* Field 1: Endpoint URL */}
-          <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
-            <label
-              htmlFor="remote-endpoint"
-              style={{
-                fontSize: "14px",
-                fontWeight: 400,
-                color: "var(--muted-foreground)",
-                lineHeight: 1.5,
-              }}
-            >
-              Endpoint URL
-            </label>
-            <Input
-              id="remote-endpoint"
-              ref={endpointRef}
-              type="text"
-              placeholder="http://host:port"
-              value={endpoint}
-              onChange={(e) => setEndpoint(e.target.value)}
-            />
+    <div className="remote-backdrop" onKeyDown={handleKeyDown} onClick={(event) => {
+      if (event.target === event.currentTarget) onClose();
+    }}>
+      <div ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby="remote-modal-title" tabIndex={-1}
+        className={`remote-dialog ${step === "browse" ? "remote-dialog-wide" : ""}`}>
+        <header className="remote-heading">
+          <div>
+            <h2 id="remote-modal-title">Open Remote Parquet File</h2>
+            <p>{step === "connection" ? "Connect to S3 or MinIO, then browse for a file." : credentials?.endpoint}</p>
           </div>
-
-          {/* Field 2: Bucket */}
-          <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
-            <label
-              htmlFor="remote-bucket"
-              style={{
-                fontSize: "14px",
-                fontWeight: 400,
-                color: "var(--muted-foreground)",
-                lineHeight: 1.5,
-              }}
-            >
-              Bucket
-            </label>
-            <Input
-              id="remote-bucket"
-              ref={bucketRef}
-              type="text"
-              value={bucket}
-              onChange={(e) => setBucket(e.target.value)}
-            />
+          <Button type="button" variant="ghost" size="icon" aria-label="Close remote browser" onClick={onClose}><X size={18} /></Button>
+        </header>
+        {step === "connection" ? (
+          <form onSubmit={(event) => { event.preventDefault(); begin("browse"); }} aria-busy={restoring}>
+            <fieldset className="remote-connection-fields" disabled={restoring}>
+              <div className="remote-field">
+                <label htmlFor="remote-endpoint">Endpoint URL</label>
+                <Input id="remote-endpoint" ref={endpointRef} placeholder="http://host:port" value={draft.endpoint}
+                  onChange={(e) => setDraft({ ...draft, endpoint: e.target.value })} />
+              </div>
+              <div className="remote-field">
+                <label htmlFor="remote-access-key-id">Access Key ID</label>
+                <Input id="remote-access-key-id" value={draft.access_key_id} autoComplete="off"
+                  onChange={(e) => setDraft({ ...draft, access_key_id: e.target.value })} />
+              </div>
+              <div className="remote-field">
+                <label htmlFor="remote-secret-key">Secret Key</label>
+                <div className="remote-secret">
+                  <Input id="remote-secret-key" type={revealed ? "text" : "password"} value={draft.secret_access_key} autoComplete="off"
+                    onChange={(e) => setDraft({ ...draft, secret_access_key: e.target.value })} />
+                  <Button type="button" variant="ghost" size="icon" onClick={() => setRevealed(!revealed)} aria-label={revealed ? "Hide secret key" : "Show secret key"}>
+                    {revealed ? <EyeOff size={16} /> : <Eye size={16} />}
+                  </Button>
+                </div>
+              </div>
+              <Button ref={primaryRef} className="remote-primary" type="submit" disabled={!canConnect}>{restoring ? "Restoring connection…" : "Browse storage"}</Button>
+              <Button type="button" variant="outline" disabled={!canConnect} onClick={() => begin("direct")}>Enter exact path</Button>
+            </fieldset>
+          </form>
+        ) : <>
+          <div className="remote-row">
+            <Button type="button" variant="outline" onClick={() => setStep("connection")}>Change connection</Button>
+            {step === "direct" && <Button type="button" variant="outline" onClick={() => setStep("browse")}>Browse storage</Button>}
           </div>
-
-          {/* Field 3: Object Key */}
-          <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
-            <label
-              htmlFor="remote-object-key"
-              style={{
-                fontSize: "14px",
-                fontWeight: 400,
-                color: "var(--muted-foreground)",
-                lineHeight: 1.5,
-              }}
-            >
-              Object Key
-            </label>
-            <Input
-              id="remote-object-key"
-              ref={objectKeyRef}
-              type="text"
-              value={objectKey}
-              onChange={(e) => setObjectKey(e.target.value)}
-            />
-          </div>
-
-          {/* Field 4: Access Key ID */}
-          <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
-            <label
-              htmlFor="remote-access-key-id"
-              style={{
-                fontSize: "14px",
-                fontWeight: 400,
-                color: "var(--muted-foreground)",
-                lineHeight: 1.5,
-              }}
-            >
-              Access Key ID
-            </label>
-            <Input
-              id="remote-access-key-id"
-              ref={accessKeyIdRef}
-              type="text"
-              value={accessKeyId}
-              onChange={(e) => setAccessKeyId(e.target.value)}
-            />
-          </div>
-
-          {/* Field 5: Secret Key — masked by default with reveal toggle (D-04) */}
-          <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
-            <label
-              htmlFor="remote-secret-key"
-              style={{
-                fontSize: "14px",
-                fontWeight: 400,
-                color: "var(--muted-foreground)",
-                lineHeight: 1.5,
-              }}
-            >
-              Secret Key
-            </label>
-            {/* Wrapper: position relative so the toggle button can be absolutely positioned */}
-            <div style={{ position: "relative" }}>
-              <Input
-                id="remote-secret-key"
-                ref={secretAccessKeyRef}
-                type={revealed ? "text" : "password"}
-                value={secretAccessKey}
-                onChange={(e) => setSecretAccessKey(e.target.value)}
-                // Right padding clears the reveal toggle icon
-                style={{ paddingRight: "40px" }}
-              />
-              {/* Reveal toggle: Eye (masked) / EyeOff (revealed) */}
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon"
-                onClick={() => setRevealed((v) => !v)}
-                aria-label={revealed ? "Hide secret key" : "Show secret key"}
-                style={{
-                  position: "absolute",
-                  right: "8px",
-                  top: "50%",
-                  transform: "translateY(-50%)",
-                }}
-              >
-                {revealed ? <EyeOff size={16} /> : <Eye size={16} />}
-              </Button>
-            </div>
-          </div>
-
-          {/* Submit: full-width, 44px min-height, disabled while any field empty (D-07) */}
-          <Button
-            ref={submitButtonRef}
-            type="submit"
-            variant="default"
-            disabled={!allFieldsFilled}
-            style={{ width: "100%", minHeight: "44px" }}
-          >
-            {restoring ? "Restoring connection…" : "Open Remote File"}
-          </Button>
-          </fieldset>
-        </form>
+          {step === "browse" && credentials ? (
+            <RemoteBrowser credentials={credentials} initialBucket={draft.bucket} initialPrefix={parentPrefix(draft.object_key)}
+              onOpen={openObject} onDirect={(bucket, prefix) => {
+                setDraft((old) => ({ ...old, bucket, object_key: old.bucket === bucket && parentPrefix(old.object_key) === prefix ? old.object_key : prefix }));
+                setStep("direct");
+              }} />
+          ) : (
+            <form className="remote-connection-fields" onSubmit={(event) => { event.preventDefault(); openObject(draft.bucket, draft.object_key); }}>
+              <p className="remote-hint">Open a known object even when listing is unavailable.</p>
+              <div className="remote-field">
+                <label htmlFor="remote-bucket">Bucket</label>
+                <Input id="remote-bucket" value={draft.bucket} onChange={(e) => setDraft({ ...draft, bucket: e.target.value })} />
+              </div>
+              <div className="remote-field">
+                <label htmlFor="remote-object-key">Object Key</label>
+                <Input id="remote-object-key" value={draft.object_key} onChange={(e) => setDraft({ ...draft, object_key: e.target.value })} />
+              </div>
+              <Button type="submit" className="remote-primary" disabled={!draft.bucket.trim() || !draft.object_key.trim()}>Open Remote File</Button>
+            </form>
+          )}
+        </>}
       </div>
     </div>
   );

@@ -55,8 +55,8 @@ export default function App() {
   // Shared open + run pipelines (WR-01/WR-02) — single implementation each.
   const { openPath, openRemote } = useOpenFile();
 
-  // Phase 5 (REMOTE-01): remote connection modal visibility state
-  const [showRemoteModal, setShowRemoteModal] = useState(false);
+  const [remoteModal, setRemoteModal] = useState<"connection" | "browse" | null>(null);
+  const activeRemoteConnection = useAppStore((s) => s.activeRemoteConnection);
   const { runQueryHandler } = useRunQuery();
 
   // Window-level drag-over state — drives DragOverlay visibility (D-17).
@@ -113,11 +113,12 @@ export default function App() {
       {/* Phase 4 (LOAD-01): global blocking overlay for file open/registration lifecycle */}
       <RegistrationOverlay />
       {/* Phase 5 (REMOTE-01): remote connection modal — zIndex 70, above RegistrationOverlay */}
-      <RemoteConnectionModal
-        open={showRemoteModal}
-        onClose={() => setShowRemoteModal(false)}
+      {remoteModal !== null && <RemoteConnectionModal
+        open
+        browseConnection={remoteModal === "browse" ? activeRemoteConnection : null}
+        onClose={() => setRemoteModal(null)}
         onSubmit={openRemote}
-      />
+      />}
     </>
   );
 
@@ -127,7 +128,7 @@ export default function App() {
   const backgroundInert =
     registrationStatus === "registering" ||
     registrationStatus === "error" ||
-    showRemoteModal
+    remoteModal !== null
       ? ""
       : undefined;
 
@@ -138,7 +139,7 @@ export default function App() {
         {rootOverlays}
         {/* inert focus trap: blocks all interaction while overlay is active (LOAD-01 / accessibility) */}
         <div inert={backgroundInert}>
-          <OpenScreen onOpenRemote={() => setShowRemoteModal(true)} />
+          <OpenScreen onOpenRemote={() => setRemoteModal("connection")} />
         </div>
       </>
     );
@@ -172,7 +173,10 @@ export default function App() {
           }}
         >
           {/* [1] Toolbar — 48px */}
-          <Toolbar onOpenRemote={() => setShowRemoteModal(true)} />
+          <Toolbar
+            onOpenRemote={() => setRemoteModal("connection")}
+            onBrowseRemote={() => setRemoteModal("browse")}
+          />
 
           {/* [2] SQL Editor — 160px fixed */}
           <SqlEditor

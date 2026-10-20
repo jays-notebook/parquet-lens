@@ -6,3 +6,4 @@
 pub mod file;
 pub mod query;
 pub mod remote_connection;
+pub mod remote_browser;

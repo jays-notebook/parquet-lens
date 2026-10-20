@@ -13,7 +13,8 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
-use datafusion::datasource::listing::{ListingTable, ListingTableConfig, ListingTableConfigExt};
+use datafusion::datasource::file_format::{FileFormatFactory, parquet::ParquetFormatFactory};
+use datafusion::datasource::listing::{ListingOptions, ListingTable, ListingTableConfig};
 use datafusion::parquet::arrow::async_reader::{AsyncFileReader, ParquetObjectReader};
 use datafusion::parquet::file::metadata::ParquetMetaData;
 use object_store::ObjectStoreExt;
@@ -98,11 +99,18 @@ impl QueryEngine {
         let object_store = source.object_store();
         new_ctx.register_object_store(source.url().as_ref(), Arc::clone(&object_store));
 
-        // Infer format and schema from the file at table_path (reads only Parquet footer metadata).
-        // ListingTableConfigExt::infer calls infer_options + infer_schema in sequence.
+        // Object keys need not have a conventional extension; this viewer always reads Parquet.
+        let state = new_ctx.state();
+        let format = ParquetFormatFactory::new()
+            .create(&state, &Default::default())
+            .map_err(|e| format!("Failed to configure Parquet reader: {}", e))?;
+        let options = ListingOptions::new(format)
+            .with_file_extension("")
+            .with_session_config_options(state.config());
         let table_path = source.table_path()?;
         let config = ListingTableConfig::new(table_path.clone())
-            .infer(&new_ctx.state())
+            .with_listing_options(options)
+            .infer_schema(&state)
             .await
             .map_err(|e| format!("Failed to infer table config: {}", e))?;
 

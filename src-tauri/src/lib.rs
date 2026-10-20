@@ -28,6 +28,8 @@ pub fn run() {
             commands::file::get_file_metadata,
             commands::file::open_remote_file,
             commands::remote_connection::get_last_remote_connection,
+            commands::remote_browser::list_remote_buckets,
+            commands::remote_browser::list_remote_prefix,
             commands::query::run_query,
             commands::query::get_last_result_meta,
             commands::query::get_page,
