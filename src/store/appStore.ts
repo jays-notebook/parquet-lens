@@ -76,16 +76,9 @@ interface AppState {
   openSeq: number;
 
   /**
-   * D-05 (Phase 5): In-session autofill memory for the remote connection form.
-   * Stores the last-entered RemoteConnection values so the form can re-populate
-   * without re-entry after app navigation or a failed open attempt.
-   *
-   * SESSION-SCOPED: this field intentionally survives reset() and setFile() —
-   * it is NOT file state. Clearing on reset would break the autofill invariant.
-   * Cleared only when the app relaunches (in-memory Zustand store; no persistence).
-   *
-   * Security note (T-05-05): stored only in the in-memory Zustand store; never
-   * written to disk, localStorage, or sessionStorage.
+   * Last successful remote connection, restored from the OS credential store.
+   * Survives reset() and setFile() because it is not file state.
+   * The frontend holds an in-memory copy only; Rust handles secure persistence.
    */
   lastRemoteConnection: RemoteConnection | null;
   setLastRemoteConnection: (conn: RemoteConnection | null) => void;
@@ -195,7 +188,7 @@ export const useAppStore = create<AppState>((set) => ({
   // D-02 (Phase 4): set or clear the verbatim registration failure text
   setRegistrationError: (msg) => set({ registrationError: msg }),
 
-  // D-05 (Phase 5): persist or clear in-session autofill values for the remote form
+  // Update the in-memory copy; secure persistence belongs to the backend.
   setLastRemoteConnection: (conn) => set({ lastRemoteConnection: conn }),
 
   reset: () =>

@@ -27,6 +27,7 @@ pub fn run() {
             commands::file::open_file,
             commands::file::get_file_metadata,
             commands::file::open_remote_file,
+            commands::remote_connection::get_last_remote_connection,
             commands::query::run_query,
             commands::query::get_last_result_meta,
             commands::query::get_page,

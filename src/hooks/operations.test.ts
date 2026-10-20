@@ -61,6 +61,44 @@ beforeEach(() => {
 
 afterEach(() => vi.restoreAllMocks());
 
+it("remembers a remote connection only after a successful open", async () => {
+  const previous = { ...conn, endpoint: "https://previous.example.com" };
+  useAppStore.getState().setLastRemoteConnection(previous);
+  let release!: () => void;
+  vi.mocked(openRemoteFile).mockImplementationOnce(async () => {
+    await new Promise<void>((resolve) => { release = resolve; });
+    return { schema };
+  });
+  const pending = handlers().openRemote(conn);
+  try {
+    expect(useAppStore.getState().lastRemoteConnection).toEqual(previous);
+  } finally {
+    release();
+    await pending;
+  }
+  expect(useAppStore.getState().lastRemoteConnection).toEqual(conn);
+});
+
+it("keeps the last successful connection when another remote open fails", async () => {
+  vi.spyOn(console, "error").mockImplementation(() => {});
+  const previous = { ...conn, endpoint: "https://previous.example.com" };
+  useAppStore.getState().setLastRemoteConnection(previous);
+  vi.mocked(openRemoteFile).mockRejectedValueOnce(new Error("Access denied"));
+  await handlers().openRemote(conn);
+  expect(useAppStore.getState().lastRemoteConnection).toEqual(previous);
+  expect(useAppStore.getState().registrationStatus).toBe("error");
+});
+
+it("keeps a successful open usable and reports a credential storage warning", async () => {
+  const warning = "Connected, but the connection could not be saved securely.";
+  vi.mocked(openRemoteFile).mockResolvedValueOnce({ schema, warning });
+  await handlers().openRemote(conn);
+  expect(useAppStore.getState().registrationStatus).toBe("registered");
+  expect(useAppStore.getState().filePath).toBe("remote.parquet");
+  expect(useAppStore.getState().lastRemoteConnection).toEqual(conn);
+  expect(useAppStore.getState().toastMessage).toBe(warning);
+});
+
 it.each(["local", "remote", "dialog", "metadata", "query"] as const)(
   "rejects new opens and queries while %s is pending, then accepts work again",
   async (operation) => {

@@ -12,7 +12,7 @@ export function useOpenFile() {
   const openSource = useCallback(async (source?: string | RemoteConnection) => {
     const {
       isLoading, registrationStatus, setRegistrationStatus, setRegistrationError,
-      setFile, setFileMetadata, setLastRemoteConnection,
+      setFile, setFileMetadata, setLastRemoteConnection, setToast,
     } = useAppStore.getState();
     if (isLoading || registrationStatus === "registering") return;
 
@@ -30,10 +30,10 @@ export function useOpenFile() {
         source = path;
       }
 
-      if (typeof source !== "string") setLastRemoteConnection(source);
       const res = typeof source === "string"
         ? await openFile(source)
         : await openRemoteFile(source);
+      if (typeof source !== "string") setLastRemoteConnection(source);
       const displayPath = typeof source === "string"
         ? source
         : source.object_key.split("/").pop() ?? source.object_key;
@@ -47,6 +47,7 @@ export function useOpenFile() {
       }
       setFile(displayPath, res.schema);
       setFileMetadata(metadata);
+      if (res.warning) setToast(res.warning);
     } catch (err) {
       // Never log the source: remote connection parameters contain credentials.
       const message = err instanceof Error ? err.message : String(err);

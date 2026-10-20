@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::ipc::{FileMetadata, OpenFileResponse};
 use crate::state::AppState;
@@ -19,7 +19,7 @@ use crate::storage::{LocalFileSource, RemoteS3Source};
 /// `Debug` is deliberately NOT derived on this struct to prevent `secret_access_key`
 /// from appearing in log output or error messages (RESEARCH §Pitfall 3, T-05-01).
 /// Never use `format!("{:?}", conn)` on this struct.
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 pub struct RemoteConnection {
     pub endpoint: String,
     pub bucket: String,
@@ -92,7 +92,7 @@ pub async fn open_file(
     engine.register_source(&source).await?;
 
     let schema = engine.get_schema()?;
-    Ok(OpenFileResponse { schema })
+    Ok(OpenFileResponse { schema, warning: None })
 }
 
 /// Returns Parquet footer metadata for the currently registered file.
@@ -148,5 +148,6 @@ pub async fn open_remote_file(
     let schema = engine
         .get_schema()
         .map_err(|e| format!("Failed to open remote object: {}", e))?;
-    Ok(OpenFileResponse { schema })
+    let warning = super::remote_connection::remember(conn).await;
+    Ok(OpenFileResponse { schema, warning })
 }

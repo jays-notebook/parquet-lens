@@ -12,6 +12,7 @@ Parquet Lens is a desktop GUI for exploring Parquet files with SQL on Windows an
 - **SQL 기반 탐색** — 열린 Parquet 파일은 `data`라는 테이블로 등록되며, `SELECT` 쿼리를 작성해 조회합니다 (읽기 전용).
 - **파일 열기** — 파일 다이얼로그 또는 드래그 앤 드롭으로 로컬 Parquet 파일을 엽니다.
 - **원격 스토리지 연결** — S3 호환 오브젝트 스토리지(AWS S3 / MinIO 등)에 있는 Parquet 파일도 직접 조회합니다.
+- **Remember remote connections** — The last successful connection (endpoint, bucket, object key, and credentials) is restored when the remote form opens, including after an app restart. It is stored in macOS Keychain or Windows Credential Manager, never browser storage or a plain-text settings file. Failed opens keep the previous successful connection. If secure storage is unavailable, the app warns and remembers the connection for the current session only.
 - **Results grid** — A scrollable TanStack Table shows result column names and types. All returned rows are rendered; the current grid does not use virtualization.
 - **메타데이터 검사** — 스키마(Schema)와 Row Group 정보를 탭으로 확인할 수 있습니다.
 - **대용량 파일 대응** — DataFusion의 지연 읽기(projection / predicate pushdown)로 수백 MB~GB급 파일도 스캔합니다.

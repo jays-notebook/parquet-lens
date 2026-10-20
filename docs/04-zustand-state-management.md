@@ -27,7 +27,7 @@ Context Provider로 트리를 감쌀 필요가 없습니다 — 스토어는 모
 - SQL 에디터 텍스트, 로딩 상태, 인라인 쿼리 오류
 - 쿼리 결과(행, 총 행 수, 캡 여부)
 - 사이드바와 파일 메타데이터
-- 원격 연결 폼의 세션 내 자동완성 메모리
+- Autofill for the last successful remote connection, restored from the OS credential store
 
 백엔드(Rust)가 진짜 데이터(파일, 쿼리 엔진)의 주인이라면, 이 스토어는 **UI 상태의 주인**입니다.
 [Tauri & IPC](./01-tauri-and-ipc.md)의 `invoke` 호출 결과가 이 스토어로 흘러 들어와 화면을 바꿉니다.
@@ -55,7 +55,7 @@ export const useAppStore = create<AppState>((set) => ({
   registrationStatus: "idle", // 파일 열기/등록 라이프사이클의 단일 진실 공급원
   registrationError: null,
   openSeq: 0,                 // Incremented by setFile/reset; not used by current hooks
-  lastRemoteConnection: null, // 세션 한정 자동완성 메모리
+  lastRemoteConnection: null, // In-memory copy of the last successful connection
 
   // ── 액션 ──
   setFile: (path, schema) => set((state) => ({ /* ... */ })),
@@ -112,14 +112,23 @@ than selecting a winning response after multiple opens have started.
 describes the query result and drives the grid, including aliases, aggregates,
 and zero-row results. `setFile` and `reset` clear the previous result schema.
 
-### `lastRemoteConnection`은 의도적으로 reset/setFile에서 살아남는다
+### `lastRemoteConnection` survives reset/setFile and app restarts
 
-원격 연결 폼의 세션 내 자동완성 메모리입니다. 파일 상태가 아니므로 `reset()`과 `setFile()`에서
-**일부러 지우지 않습니다** — 지우면 자동완성 불변식이 깨집니다. 앱을 다시 실행할 때만
-사라집니다(인메모리 Zustand 스토어, 영속화 없음).
+The store holds an in-memory copy of the last successful remote connection.
+It is not file state, so `reset()` and `setFile()` leave it intact. Failed opens
+do not replace it. After successful remote registration, Rust stores all five
+fields as one secret in macOS Keychain or Windows Credential Manager.
 
-> 보안 메모: 이 값은 인메모리 스토어에만 저장되며, 디스크·localStorage·sessionStorage에 절대
-> 기록되지 않습니다(자격 증명을 디스크에 남기지 않음).
+When the remote form opens without a cached connection, it calls
+`get_last_remote_connection` to restore the saved values. Inputs remain disabled
+until that read finishes, and closing the form discards a late response.
+An unavailable or corrupt credential store shows a toast and permits manual input.
+Saving failures also show a toast; the successful file remains usable and the
+connection stays available in memory for the current session.
+
+Credentials are never written to `localStorage`, `sessionStorage`, or a plain-text
+settings file. Only the latest successful connection is retained. Its OS credential
+entry uses service `com.parquet-lens.app` and account `last-remote-connection`.
 
 ### 오류 상태를 언제 비우는가
 
