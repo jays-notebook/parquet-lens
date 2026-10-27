@@ -1,0 +1,44 @@
+name: Dependency security
+
+on:
+  pull_request:
+    paths:
+      - 'package-lock.json'
+      - 'src-tauri/Cargo.lock'
+      - 'src-tauri/vendor/**'
+      - 'osv-scanner.toml'
+      - '.github/workflows/security.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'package-lock.json'
+      - 'src-tauri/Cargo.lock'
+      - 'src-tauri/vendor/**'
+      - 'osv-scanner.toml'
+      - '.github/workflows/security.yml'
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  advisories:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install verified OSV-Scanner
+        run: |
+          curl --fail --location --retry 3 \
+            https://github.com/google/osv-scanner/releases/download/v2.7.0/osv-scanner_linux_amd64 \
+            --output "$RUNNER_TEMP/osv-scanner"
+          echo "160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b  $RUNNER_TEMP/osv-scanner" | sha256sum --check
+          chmod +x "$RUNNER_TEMP/osv-scanner"
+      - name: Check both lockfiles against current public advisories
+        run: |
+          "$RUNNER_TEMP/osv-scanner" scan source \
+            --offline --download-offline-databases \
+            --config osv-scanner.toml \
+            --lockfile package-lock.json --lockfile src-tauri/Cargo.lock

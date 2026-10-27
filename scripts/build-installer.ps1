@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     Builds the Windows installer for parquet-lens.
@@ -9,10 +9,10 @@
       1. Locates and imports the MSVC build environment (vcvars64.bat) so that
          `cargo`/`tauri build` can link. On this machine a plain shell lacks the
          MSVC linker on PATH, so this step is mandatory.
-      2. Ensures frontend dependencies are installed. `tauri build` invokes the
+      2. Installs frontend dependencies from the lockfile. `tauri build` invokes the
          frontend build and uses the Tauri CLI, both of which live in
          node_modules; a missing tree would fail the build immediately.
-      3. Runs `npm run tauri build -- --bundles <target>` from the project root.
+      3. Runs `npm run tauri build -- --bundles <target> -- --locked` from the project root.
       4. Retries on transient file-lock failures (os error 32). The corporate
          Bitdefender real-time scanner intermittently locks freshly written
          build artifacts; incremental compilation persists across runs, so a
@@ -86,20 +86,11 @@ Import-VcVarsEnv -VcVarsPath $vcvars
 
 Push-Location $ProjectRoot
 try {
-    # Ensure frontend dependencies are present. `tauri build` runs the frontend
-    # build (beforeBuildCommand) and relies on the Tauri CLI, both of which live
-    # in node_modules; a missing tree fails the build on the first line. Prefer
-    # `npm ci` for a clean, lockfile-exact install when a lockfile is available.
-    if (-not (Test-Path (Join-Path $ProjectRoot "node_modules"))) {
-        Write-Host "node_modules not found - installing dependencies..." -ForegroundColor Cyan
-        if (Test-Path (Join-Path $ProjectRoot "package-lock.json")) {
-            & npm ci
-        } else {
-            & npm install
-        }
-        if ($LASTEXITCODE -ne 0) {
-            throw "Dependency installation failed (exit $LASTEXITCODE)."
-        }
+    # A release must use the audited lockfile, including when node_modules already exists.
+    Write-Host "잠금파일에 맞춰 의존성을 설치합니다..." -ForegroundColor Cyan
+    & npm ci --no-audit --no-fund
+    if ($LASTEXITCODE -ne 0) {
+        throw "의존성 설치에 실패했습니다 (종료 코드 $LASTEXITCODE)."
     }
 
     $attempt = 0
@@ -110,7 +101,7 @@ try {
         Write-Host "=== Build attempt $attempt of $MaxRetries (bundles: $Bundles) ===" -ForegroundColor Yellow
 
         # npm exit code lands in $LASTEXITCODE; do not let a non-zero exit throw.
-        & npm run tauri build -- --bundles $Bundles
+        & npm run tauri build -- --bundles $Bundles -- --locked
         if ($LASTEXITCODE -eq 0) {
             $succeeded = $true
             break

@@ -10,7 +10,7 @@ export default defineConfig(async () => ({
   // Path aliases for shadcn/ui component imports
   resolve: {
     alias: {
-      "@": resolve(__dirname, "./src"),
+      "@": resolve(import.meta.dirname, "./src"),
     },
   },
 

@@ -41,7 +41,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
-          node-version: lts/*
+          node-version-file: '.node-version'
           cache: npm
 
       - name: Setup Rust
@@ -55,13 +55,7 @@ jobs:
           workspaces: './src-tauri -> target'
 
       - name: Install frontend dependencies
-        # Use `npm install` rather than `npm ci`: Tailwind v4 pulls in a
-        # wasm fallback (@tailwindcss/oxide-wasm32-wasi) whose nested optional
-        # deps (@emnapi/core, @emnapi/runtime) npm cannot fully record in the
-        # lockfile from a Linux host, so `npm ci`'s strict sync check fails on
-        # the Windows/macOS runners. `npm install` reconciles and installs the
-        # correct per-platform deps without erroring on the lockfile mismatch.
-        run: npm install --no-audit --no-fund
+        run: npm ci --no-audit --no-fund
 
       - name: Build app and (on tag) publish release
         id: tauri
@@ -76,7 +70,7 @@ jobs:
           releaseBody: 'Download the installer for your platform from the assets below.'
           releaseDraft: true
           prerelease: false
-          args: ${{ matrix.tauri-args }}
+          args: ${{ matrix.tauri-args }} -- --locked
 
       # On manual runs there is no tag/Release, so expose the installers as
       # downloadable workflow artifacts instead.

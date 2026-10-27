@@ -154,14 +154,11 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
-          node-version: lts/*
+          node-version-file: '.node-version'
           cache: npm
 
       - name: Install frontend dependencies
-        # `npm ci` is unusable in this repo: Tailwind v4's wasm fallback has
-        # nested optional deps npm cannot fully lock cross-platform, so the
-        # strict sync check fails. Full rationale in release.yml.
-        run: npm install --no-audit --no-fund
+        run: npm ci --no-audit --no-fund
 
       - name: Run vitest suite
         run: npm test
@@ -206,3 +203,13 @@ jobs:
         # `--locked` turns silent Cargo.lock drift into a CI failure.
         working-directory: ./src-tauri
         run: cargo test --locked
+
+      - name: Check Zstd advisory feature assumptions
+        shell: bash
+        working-directory: ./src-tauri
+        run: |
+          features="$(cargo tree --locked --edges normal,build --prefix none --format '{p} features=[{f}]' --features custom-protocol)"
+          if grep -E '^zstd(-safe|-sys)? .*features=\[[^]]*(experimental|seekable|legacy|zstdmt|zdict_builder)' <<< "$features"; then
+            echo 'Zstd 보안 예외 조건이 바뀌었습니다. osv-scanner.toml의 예외를 재검토하세요.'
+            exit 1
+          fi

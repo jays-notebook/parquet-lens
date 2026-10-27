@@ -11,7 +11,11 @@ use parquet_lens_lib::storage::browser::{RemoteCredentials, list_buckets, list_p
 use parquet_lens_lib::storage::{DataSource, RemoteS3Source};
 use std::sync::Arc;
 
-fn server(responses: Vec<(u16, &'static str)>) -> (RemoteCredentials, Receiver<String>) {
+fn server(responses: Vec<(u16, impl Into<String>)>) -> (RemoteCredentials, Receiver<String>) {
+    let responses: Vec<(u16, String)> = responses
+        .into_iter()
+        .map(|(status, body)| (status, body.into()))
+        .collect();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let (tx, rx) = mpsc::channel();
@@ -143,8 +147,38 @@ async fn invalid_response_is_not_reported_as_an_empty_bucket_list() {
 }
 
 #[tokio::test]
+async fn excessive_xml_namespaces_are_rejected_by_both_listing_parsers() {
+    let namespaces = (0..300)
+        .map(|i| format!(" xmlns:n{i}=\"urn:{i}\""))
+        .collect::<String>();
+    let (credentials, _) = server(vec![(
+        200,
+        format!("<ListAllMyBucketsResult{namespaces}><Buckets/></ListAllMyBucketsResult>"),
+    )]);
+    assert!(
+        list_buckets(&credentials, None)
+            .await
+            .unwrap_err()
+            .contains("Invalid bucket listing")
+    );
+    let (credentials, _) = server(vec![(
+        200,
+        format!(
+            "<ListBucketResult{namespaces}><Name>analytics</Name><IsTruncated>false</IsTruncated></ListBucketResult>"
+        ),
+    )]);
+    assert!(
+        list_prefix(&credentials, "analytics", "", None)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn invalid_endpoints_credentials_and_prefixes_fail_before_network_io() {
     for endpoint in [
+        "http://example.com",
+        "http://192.168.1.10:9000",
         "file:///tmp/data",
         "http://user:secret@localhost:9",
         "https://localhost:9/?secret=key",
@@ -156,6 +190,11 @@ async fn invalid_endpoints_credentials_and_prefixes_fail_before_network_io() {
             secret_access_key: "secret".into(),
         };
         let error = list_buckets(&credentials, None).await.unwrap_err();
+        assert!(error.contains("endpoint"));
+        assert!(!error.contains("secret"));
+        let error = list_prefix(&credentials, "analytics", "", None)
+            .await
+            .unwrap_err();
         assert!(error.contains("endpoint"));
         assert!(!error.contains("secret"));
     }

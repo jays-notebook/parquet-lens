@@ -9,7 +9,7 @@ use object_store::list::{PaginatedListOptions, PaginatedListStore};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use super::remote::{REGION, build_store, client_options};
+use super::remote::{REGION, build_store, client_options, validate_endpoint};
 
 const PAGE_SIZE: usize = 200;
 
@@ -23,20 +23,7 @@ pub struct RemoteCredentials {
 
 impl RemoteCredentials {
     fn validate(&self) -> Result<Url, String> {
-        let invalid_endpoint = || {
-            "Invalid endpoint. Use an HTTP(S) URL without embedded credentials, query, or fragment."
-                .to_string()
-        };
-        let url = Url::parse(&self.endpoint).map_err(|_| invalid_endpoint())?;
-        if !matches!(url.scheme(), "http" | "https")
-            || url.host_str().is_none()
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.query().is_some()
-            || url.fragment().is_some()
-        {
-            return Err(invalid_endpoint());
-        }
+        let url = validate_endpoint(&self.endpoint)?;
         // AwsAuthorizer builds an HTTP header from the key ID.
         if self.access_key_id.is_empty()
             || !self.access_key_id.bytes().all(|b| b.is_ascii_graphic())
@@ -147,7 +134,7 @@ pub async fn list_buckets(
     };
     AwsAuthorizer::new(&credential, "s3", REGION).authorize(&mut request, None);
     let client = ReqwestConnector::default()
-        .connect(&client_options().with_timeout(Duration::from_secs(30)))
+        .connect(&client_options(&url).with_timeout(Duration::from_secs(30)))
         .map_err(|_| "Could not configure the remote connection.".to_string())?;
     let response = client.execute(request).await.map_err(|_| {
         "Could not reach the endpoint. Check the address and connection, then retry.".to_string()

@@ -104,9 +104,7 @@ impl QueryEngine {
         let format = ParquetFormatFactory::new()
             .create(&state, &Default::default())
             .map_err(|e| format!("Failed to configure Parquet reader: {}", e))?;
-        let options = ListingOptions::new(format)
-            .with_file_extension("")
-            .with_session_config_options(state.config());
+        let options = ListingOptions::new(format).with_file_extension("");
         let table_path = source.table_path()?;
         let config = ListingTableConfig::new(table_path.clone())
             .with_listing_options(options)
