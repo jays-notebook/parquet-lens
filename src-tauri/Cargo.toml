@@ -1,6 +1,6 @@
 [package]
 name = "parquet-lens"
-version = "1.1.0"
+version = "1.1.1"
 edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -15,16 +15,23 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
-# DataFusion 54 re-exports arrow and parquet; do NOT add them as direct deps (PITFALLS.md §Pitfall 3)
-datafusion = { version = "54", features = ["parquet"] }
+# DataFusion re-exports arrow and parquet; do NOT add them as direct deps (PITFALLS.md §Pitfall 3)
+datafusion = { version = "55.2", features = ["parquet"] }
 object_store = { version = "0.13", features = ["aws"] }
-quick-xml = { version = "0.39", features = ["serialize"] }
+quick-xml = { version = "0.41", features = ["serialize"] }
 url = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread"] }
 futures = "0.3"
 keyring = { version = "3.6.3", features = ["apple-native", "windows-native"] }
+
+[dev-dependencies]
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+
+[patch.crates-io]
+# shortcut: remove the vendor patch when compatible upstream supports patched XML and redirect control.
+object_store = { path = "vendor/object_store" }
 
 [features]
 # This feature is used for production builds or when `devPath` points to the filesystem

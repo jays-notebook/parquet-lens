@@ -19,6 +19,15 @@ Parquet Lens is a desktop GUI for exploring Parquet files with SQL on Windows an
 - **메타데이터 검사** — 스키마(Schema)와 Row Group 정보를 탭으로 확인할 수 있습니다.
 - **대용량 파일 대응** — DataFusion의 지연 읽기(projection / predicate pushdown)로 수백 MB~GB급 파일도 스캔합니다.
 
+## Remote connection security
+
+Remote endpoints require HTTPS with a valid certificate. Private MinIO deployments must install their CA in the operating system's trusted certificate store. Certificate verification cannot be disabled.
+
+HTTP is accepted only for `localhost`, IPv4 loopback, or IPv6 loopback endpoints, so a local SSH tunnel can connect to an internal HTTP service. Bind host-side tunnels to loopback; public and private-network HTTP endpoints are rejected. This policy applies to browsing and direct file opens, including restored connections.
+
+Automatic HTTP redirects are rejected. Enter the final S3 API endpoint directly;
+redirects cannot bypass the transport policy or move requests outside a tunnel.
+
 ## 동작 방식 & 성능
 
 - The backend retains and returns **at most 100 result rows**. The grid renders those rows; its cost also depends on the number of columns and cell contents.
@@ -30,7 +39,7 @@ Parquet Lens is a desktop GUI for exploring Parquet files with SQL on Windows an
 | 영역 | 사용 기술 |
 |------|-----------|
 | 셸 / 런타임 | [Tauri v2](https://tauri.app/) (Rust 백엔드 + 웹 UI) |
-| 쿼리 엔진 | [Apache DataFusion](https://datafusion.apache.org/) 54 (순수 Rust, 임베디드) |
+| Query engine | [Apache DataFusion](https://datafusion.apache.org/) 55 (embedded Rust engine) |
 | 프런트엔드 | React 18 · TypeScript · Vite · Tailwind CSS |
 | 에디터 | CodeMirror (`@codemirror/lang-sql`) |
 | Results grid | TanStack Table (TanStack Virtual is installed but currently unused) |
@@ -42,14 +51,14 @@ Parquet Lens is a desktop GUI for exploring Parquet files with SQL on Windows an
 ## 요구 사항 / 제약
 
 - **Platforms**: Windows and macOS; the release workflow builds Windows installers and a universal macOS DMG.
-- **Build tools**: Rust (2024 edition), Node.js, and platform tooling: Visual Studio C++ Build Tools on Windows or Xcode Command Line Tools on macOS.
+- **Build tools**: Rust (2024 edition), Node.js 24.22.1 (pinned in `.node-version`), and platform tooling: Visual Studio C++ Build Tools on Windows or Xcode Command Line Tools on macOS. Use rustup 1.29.2 or later.
 - **SQL 범위**: `SELECT` 전용 (읽기 전용)
 
 ## 개발 환경 실행
 
 ```bash
-# 의존성 설치
-npm install
+# Install the locked dependencies
+npm ci --no-audit --no-fund
 
 # 개발 모드 실행 (Tauri dev — MSVC 환경이 로드된 셸에서 실행)
 npm run tauri dev

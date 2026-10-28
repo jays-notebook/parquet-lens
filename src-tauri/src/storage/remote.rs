@@ -4,7 +4,7 @@
 //! for Parquet objects hosted on S3-compatible endpoints (MinIO, AWS S3, etc.).
 //!
 //! All S3 client construction — custom endpoint, path-style addressing, HTTP allowance,
-//! self-signed TLS acceptance, and credentials — is encapsulated here. Nothing leaks
+//! certificate verification, and credentials — is encapsulated here. Nothing leaks
 //! past the `storage/` boundary into the engine or command layers
 //! (ARCHITECTURE.md Anti-Pattern 3).
 //!
@@ -17,19 +17,41 @@ use std::sync::Arc;
 
 use datafusion::datasource::listing::ListingTableUrl;
 use datafusion::execution::object_store::ObjectStoreUrl;
+use object_store::ObjectStore;
 use object_store::aws::{AmazonS3, AmazonS3Builder};
 use object_store::client::ClientOptions;
-use object_store::ObjectStore;
+use url::{Host, Url};
 
 use super::DataSource;
 
 pub(super) const REGION: &str = "us-east-1";
 
-pub(super) fn client_options() -> ClientOptions {
-    // Internal MinIO compatibility, shared by browsing and file reads.
-    ClientOptions::new()
-        .with_allow_invalid_certificates(true)
-        .with_allow_http(true)
+pub(super) fn validate_endpoint(endpoint: &str) -> Result<Url, String> {
+    let invalid = || {
+        "Invalid endpoint. Use HTTPS without embedded credentials, query, or fragment. HTTP is allowed only for loopback tunnels.".to_string()
+    };
+    let url = Url::parse(endpoint).map_err(|_| invalid())?;
+    let loopback = match url.host() {
+        Some(Host::Domain("localhost")) => true,
+        Some(Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(Host::Ipv6(ip)) => ip.is_loopback(),
+        _ => false,
+    };
+    if url.host().is_none()
+        || !(url.scheme() == "https" || (url.scheme() == "http" && loopback))
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(invalid());
+    }
+    Ok(url)
+}
+
+pub(super) fn client_options(endpoint: &Url) -> ClientOptions {
+    // Endpoint validation permits plaintext only inside a local tunnel.
+    ClientOptions::new().with_allow_http(endpoint.scheme() == "http")
 }
 
 pub(super) fn build_store(
@@ -38,18 +60,19 @@ pub(super) fn build_store(
     access_key_id: &str,
     secret_access_key: &str,
 ) -> Result<AmazonS3, String> {
+    let endpoint = validate_endpoint(endpoint)?;
     if bucket.trim().is_empty() {
         return Err("Bucket name must not be empty".into());
     }
     ObjectStoreUrl::parse(format!("s3://{bucket}"))
         .map_err(|_| "Invalid bucket name: must be a valid S3 bucket identifier".to_string())?;
     AmazonS3Builder::new()
-        .with_endpoint(endpoint.trim_end_matches('/'))
+        .with_endpoint(endpoint.as_str().trim_end_matches('/'))
         .with_bucket_name(bucket)
         .with_access_key_id(access_key_id)
         .with_secret_access_key(secret_access_key)
         .with_region(REGION)
-        .with_client_options(client_options())
+        .with_client_options(client_options(&endpoint))
         .build()
         .map_err(|_| "Could not configure remote storage. Check the connection details.".into())
 }
@@ -75,12 +98,12 @@ impl RemoteS3Source {
     /// Creates a new `RemoteS3Source` from S3/MinIO connection parameters.
     ///
     /// Constructs an `AmazonS3` store configured for path-style addressing (MinIO default),
-    /// HTTP endpoints, and self-signed TLS. Returns `Err` if the store cannot be built
+    /// verified HTTPS and loopback HTTP tunnels. Returns `Err` if the store cannot be built
     /// (e.g., invalid endpoint URL) — no panic.
     ///
     /// # Arguments
     ///
-    /// * `endpoint` — Full URL of the MinIO/S3 endpoint, e.g. `http://192.168.1.100:9000`
+    /// * `endpoint` — Full URL of the MinIO/S3 endpoint, e.g. `https://minio.example.com`
     /// * `bucket` — Bucket name
     /// * `object_key` — Object key (path within the bucket), e.g. `folder/data.parquet`
     /// * `access_key_id` — S3 access key ID
@@ -171,7 +194,10 @@ mod tests {
         let err = RemoteS3Source::new(EP, "my bucket", "k.parquet", AK, SK)
             .err()
             .expect("invalid bucket should be Err");
-        assert!(err.contains("Invalid bucket name"), "unexpected error: {err}");
+        assert!(
+            err.contains("Invalid bucket name"),
+            "unexpected error: {err}"
+        );
     }
 
     // WR-03: blank bucket / object key are rejected at the backend boundary.
@@ -180,7 +206,10 @@ mod tests {
         let err = RemoteS3Source::new(EP, "   ", "k.parquet", AK, SK)
             .err()
             .expect("empty bucket should be Err");
-        assert!(err.contains("Bucket name must not be empty"), "unexpected error: {err}");
+        assert!(
+            err.contains("Bucket name must not be empty"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -188,7 +217,10 @@ mod tests {
         let err = RemoteS3Source::new(EP, "bucket", "  ", AK, SK)
             .err()
             .expect("empty object key should be Err");
-        assert!(err.contains("Object key must not be empty"), "unexpected error: {err}");
+        assert!(
+            err.contains("Object key must not be empty"),
+            "unexpected error: {err}"
+        );
     }
 
     // A valid bucket constructs successfully and url() does not panic.
@@ -206,7 +238,11 @@ mod tests {
         let src = RemoteS3Source::new(EP, "valid-bucket", "dir/data.parquet", AK, SK)
             .expect("valid params should build");
         let result = src.table_path();
-        assert!(result.is_ok(), "table_path() should return Ok, got: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "table_path() should return Ok, got: {:?}",
+            result.err()
+        );
         let expected = ListingTableUrl::parse("s3://valid-bucket/dir/data.parquet").unwrap();
         assert_eq!(result.unwrap(), expected);
     }

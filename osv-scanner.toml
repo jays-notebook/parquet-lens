@@ -1,0 +1,77 @@
+# Review target exclusions before adding Linux support. No shipped platform is excluded.
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0429"
+ignoreUntil = 2027-01-24
+reason = "glib 0.18 is pulled in by Tauri's Linux GTK backend; absent from Windows and macOS dependency graphs. Linux is not shipped. Recheck upstream GTK migration before expiry."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0370"
+ignoreUntil = 2027-01-24
+reason = "Unmaintained proc-macro-error 1.x is pulled in by Tauri's Linux GTK macros; absent from Windows and macOS dependency graphs. Recheck upstream replacement before expiry."
+
+# Reviewed against the locked source and feature graphs on 2026-10-28.
+# These APIs are not reached; the packages remain affected. See docs/ci.md.
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0391"
+ignoreUntil = 2026-11-27
+reason = "No borrowed streaming with_context use: Parquet/Arrow contexts are bulk-only; DataFusion creates a fresh owned read decoder. Recheck on dependency or compression API changes."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0395"
+ignoreUntil = 2026-11-27
+reason = "zstd-safe 7.3.0 has only std enabled; StableInBuffer requires the disabled experimental feature. CI guards this feature assumption."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0396"
+ignoreUntil = 2026-11-27
+reason = "The seekable feature is disabled in zstd-safe and the shared zstd-sys graph. CI guards this feature assumption."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0397"
+ignoreUntil = 2026-11-27
+reason = "No OutBuffer::around_pos calls in the locked consumers or zstd 0.13 internal paths. The read wrapper uses initialized slices at position zero. Recheck on dependency or buffer API changes."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0398"
+ignoreUntil = 2026-11-27
+reason = "The seekable feature is disabled in zstd-safe and the shared zstd-sys graph. CI guards this feature assumption."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0399"
+ignoreUntil = 2026-11-27
+reason = "init_using_cdict/init_using_ddict require the disabled experimental feature. CI guards this feature assumption."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0400"
+ignoreUntil = 2026-11-27
+reason = "No context mixes streaming and one-shot operations: Parquet/Arrow use bulk-only contexts; DataFusion read decoders own separate contexts. Recheck on dependency or context-management changes."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0401"
+ignoreUntil = 2026-11-27
+reason = "train_from_buffer is not compiled because zdict_builder is disabled. No dictionary training is used. CI guards this feature assumption."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0402"
+ignoreUntil = 2026-11-27
+reason = "Both experimental and zstdmt are disabled, including in the shared zstd-sys graph. CI guards this feature assumption."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0403"
+ignoreUntil = 2026-11-27
+reason = "Legacy decoding is disabled in the shared zstd-sys graph. Parquet/Arrow bulk and DataFusion read decoders are also explicitly unaffected by this advisory; the write decoder is unused."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0404"
+ignoreUntil = 2026-11-27
+reason = "DCtx::try_clone requires the disabled experimental feature. CI guards this feature assumption."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0405"
+ignoreUntil = 2026-11-27
+reason = "The affected SeekableCStream API requires the disabled seekable feature. CI guards this feature assumption."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0406"
+ignoreUntil = 2026-11-27
+reason = "zstdmt is disabled in both safe wrappers and shared zstd-sys; no NbWorkers configuration is used. CI guards this feature assumption."

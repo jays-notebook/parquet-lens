@@ -127,7 +127,7 @@ export function RemoteConnectionModal({ open, onClose, onSubmit, browseConnectio
             <fieldset className="remote-connection-fields" disabled={restoring}>
               <div className="remote-field">
                 <label htmlFor="remote-endpoint">Endpoint URL</label>
-                <Input id="remote-endpoint" ref={endpointRef} placeholder="http://host:port" value={draft.endpoint}
+                <Input id="remote-endpoint" ref={endpointRef} placeholder="https://storage.example.com" value={draft.endpoint}
                   onChange={(e) => setDraft({ ...draft, endpoint: e.target.value })} />
               </div>
               <div className="remote-field">
